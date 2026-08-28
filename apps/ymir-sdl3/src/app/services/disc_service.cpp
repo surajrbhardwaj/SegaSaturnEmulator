@@ -58,14 +58,12 @@ void DiscService::ProcessOpenDiscImageFileDialogSelection(const char *const *fil
 }
 
 bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal) {
-    auto &settings = m_settings;
-
     // Try to load disc image from specified path
     devlog::info<grp::base>("Loading disc image from {}", path);
     ymir::media::Disc disc{};
 
-    auto showError = [this, path, showErrorModal](std::string message) {
-        m_showModal("Error", [this, path, message] {
+    auto showError = [this, path](std::string message) {
+        t_showModal("Error", [this, path, message] {
             ImGui::TextUnformatted(fmt::format("Could not load {} as a game disc image.", path).c_str());
             ImGui::NewLine();
             ImGui::TextUnformatted(message.c_str());
