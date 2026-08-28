@@ -3,19 +3,36 @@
 #include <app/settings.hpp>
 #include <app/shared_context.hpp>
 
+#include <ymir/media/disc.hpp>
+
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <thread>
 
 namespace app::services {
 
 /// @brief Handles loading disc images and the recent games list.
 class DiscService {
 public:
+    enum class DiskLoadStatus : uint8 {
+        DEFAULT = 0,
+        SUCCESS = 1,
+        FAIL = 2
+    };
+    
+    std::atomic<DiskLoadStatus> m_asyncLoadStatus;
+    std::thread asyncDiscLoadThread;
+    ymir::media::Disc asyncDisc;
+
     using ShowModalCallback = std::function<void(std::string title, std::function<void()> contents)>;
 
     DiscService(SharedContext &context, Settings &settings, ShowModalCallback showModal);
-    ~DiscService() = default;
+    ~DiscService() {
+        if(asyncDiscLoadThread.joinable()) {
+            asyncDiscLoadThread.join();
+        }
+    }
 
     DiscService(const DiscService &) = delete;
     DiscService &operator=(const DiscService &) = delete;
@@ -33,6 +50,9 @@ public:
     /// @param[in] showErrorModal Whether to show an error dialog if loading fails.
     /// @return True if successful.
     bool LoadDiscImage(std::filesystem::path path, bool showErrorModal);
+    
+    // TODO: add some documenation here
+    void LoadDiscImageAsync(std::filesystem::path path, bool showErrorModal);
 
     /// @brief Loads the list of recent discs from disk.
     void LoadRecentDiscs();
@@ -44,6 +64,8 @@ private:
     SharedContext &m_context;
     Settings &m_settings;
     ShowModalCallback m_showModal;
+    
+    void UpdateSettingsAndContext(ymir::media::Disc disc);
 };
 
 } // namespace app::services

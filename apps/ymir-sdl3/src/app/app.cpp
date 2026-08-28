@@ -3390,6 +3390,15 @@ void App::EmulatorThread() {
         for (size_t i = 0; i < evtCount; i++) {
             EmuEvent &evt = evts[i];
             using enum EmuEvent::Type;
+            
+            switch(m_discService.m_asyncLoadStatus.load()) {
+                case DiscService::DiscLoadStatus::SUCCESS:
+                    m_discService.UpdateSettingsAndContext(m_discService.asyncDisc);
+                case DiscService::DiscLoadStatus::FAIL:
+                    m_discService.m_asyncLoadStatus = DiscService::DiscLoadStatus::DEFAULT;
+                    break;
+            }
+
             switch (evt.type) {
             case FactoryReset:
                 m_context.saturn.instance->FactoryReset();
@@ -3464,6 +3473,8 @@ void App::EmulatorThread() {
             {
                 auto &path = std::get<std::filesystem::path>(evt.value);
                 // LoadDiscImage locks the disc mutex
+                m_discService.LoadDiscImageAsync(path, true);
+                /*
                 if (m_discService.LoadDiscImage(path, true)) {
                     m_saveStateService.LoadSaveStates();
                     m_saveStateService.LoadDebuggerState();
@@ -3473,6 +3484,7 @@ void App::EmulatorThread() {
                             fmt::format("Could not load IPL ROM: {}", iplLoadResult.errorMessage));
                     }
                 }
+                */
                 break;
             }
             case OpenHostDevice: //

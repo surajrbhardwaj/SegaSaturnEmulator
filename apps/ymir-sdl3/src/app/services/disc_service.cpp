@@ -26,7 +26,8 @@ namespace app::services {
 DiscService::DiscService(SharedContext &context, Settings &settings, ShowModalCallback showModal)
     : m_context(context)
     , m_settings(settings)
-    , m_showModal(std::move(showModal)) {}
+    , m_showModal(std::move(showModal))
+    , m_asyncLoadStatus(DiscService::DiscLoadStatus::DEFAULT) {}
 
 void DiscService::OpenLoadDiscDialog() {
     FileDialogParams params{};
@@ -58,6 +59,12 @@ void DiscService::ProcessOpenDiscImageFileDialogSelection(const char *const *fil
 }
 
 bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal) {
+    // If a disc is being loaded asyncronously, wait until it is done
+    if(asyncDiscLoadThread.joinable()) {
+        asyncDiscLoadThread.join();
+        m_asyncLoadStatus = DiscService::DiscLoadStatus::DEFAULT;
+    }
+
     // Try to load disc image from specified path
     devlog::info<grp::base>("Loading disc image from {}", path);
     ymir::media::Disc disc{};
@@ -128,6 +135,120 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     }
     devlog::info<grp::base>("Disc image loaded succesfully");
 
+    UpdateSettingsAndContext(disc);
+
+    return true;
+}
+
+void DiscService::LoadDiscImageAsync(std::filesystem::path path, bool showErrorModal) {
+    // Try to load disc image from specified path
+    devlog::info<grp::base>("Loading disc image from {}", path);
+    ymir::media::Disc disc{};
+
+    auto showError = [this, path](std::string message) {
+        t_showModal("Error", [this, path, message] {
+            ImGui::TextUnformatted(fmt::format("Could not load {} as a game disc image.", path).c_str());
+            ImGui::NewLine();
+            ImGui::TextUnformatted(message.c_str());
+#ifdef __linux__
+            // Check if we're running inside Flatpak's sandbox and warn user about filesystem permissions
+            if (getenv("FLATPAK_ID") != nullptr) {
+                ImGui::Separator();
+                ImGui::PushFont(m_context.fonts.sansSerif.bold, m_context.fontSizes.medium);
+                ImGui::TextColored(m_context.colors.notice, "Flatpak restricts access to the filesystem by default.");
+                ImGui::TextColored(m_context.colors.notice,
+                                   "You must manually grant Ymir permission to access the directory.");
+                ImGui::PopFont();
+                ImGui::TextUnformatted(
+                    "You can ignore this error if you already granted permission to read the files.\n"
+                    "In this case, the image is probably invalid or unsupported by Ymir.");
+                ImGui::NewLine();
+                ImGui::TextUnformatted("Learn more about Flatpak's sandbox system:");
+                ImGui::Bullet();
+                ImGui::TextLinkOpenURL("Flatpak - Sandbox permissions",
+                                       R"(https://docs.flatpak.org/en/latest/sandbox-permissions.html)");
+                ImGui::Bullet();
+                ImGui::TextLinkOpenURL("Flatseal - Filesystem permissions",
+                                       R"(https://github.com/tchx84/Flatseal/blob/master/DOCUMENTATION.md#filesystem)");
+                ImGui::Bullet();
+                ImGui::TextLinkOpenURL(
+                    "How to configure Ymir using Flatseal",
+                    R"(https://github.com/StrikerX3/Ymir/blob/main/TROUBLESHOOTING.md#game-discs-dont-load-with-the-flatpak-release)");
+            }
+#endif
+            ImGui::Separator();
+        });
+    };
+
+    bool hasErrors = false;
+    if (!ymir::media::LoadDisc(path, disc, m_settings.general.preloadDiscImagesToRAM,
+                               [&](ymir::media::MessageType type, std::string message) {
+                                   switch (type) {
+                                   case ymir::media::MessageType::InvalidFormat:
+                                       devlog::trace<grp::media>("{}", message);
+                                       break;
+                                   case ymir::media::MessageType::Debug:
+                                       devlog::trace<grp::media>("{}", message);
+                                       break;
+                                   case ymir::media::MessageType::Error:
+                                       devlog::error<grp::media>("{}", message);
+                                       if (showErrorModal) {
+                                           hasErrors = true;
+                                           showError(message);
+                                       }
+                                       break;
+                                   case ymir::media::MessageType::NotValid:
+                                       devlog::error<grp::media>("{}", message);
+                                       if (showErrorModal && !hasErrors) {
+                                           showError(message);
+                                       }
+                                       break;
+                                   default: break;
+                                   }
+                               })) {
+        devlog::error<grp::base>("Failed to load disc image");
+        m_asyncLoadStatus = DiscService::DiscLoadStatus::FAIL;
+
+        return false;
+    }
+    devlog::info<grp::base>("Disc image loaded succesfully");
+    this->asyncDisc = std::move(disc);
+    m_asyncLoadStatus = DiscService::DiscLoadStatus::SUCCESS;
+
+    return true;
+}
+
+void DiscService::LoadRecentDiscs() {
+    auto listPath = m_context.profile.GetPath(ProfilePath::PersistentState) / "recent_discs.txt";
+    std::ifstream in{listPath};
+    if (!in) {
+        return;
+    }
+
+    m_context.state.recentDiscs.clear();
+    while (in) {
+        std::string line;
+        if (!std::getline(in, line)) {
+            break;
+        }
+        std::u8string u8line{line.begin(), line.end()};
+        std::filesystem::path path = u8line;
+        if (!path.empty()) {
+            m_context.state.recentDiscs.push_back(path);
+        }
+    }
+}
+
+void DiscService::SaveRecentDiscs() {
+    auto listPath = m_context.profile.GetPath(ProfilePath::PersistentState) / "recent_discs.txt";
+    std::ofstream out{listPath};
+    for (auto &path : m_context.state.recentDiscs) {
+        std::u8string u8path = path.u8string();
+        out << reinterpret_cast<const char *>(u8path.data()) << "\n";
+    }
+}
+
+void UpdateSettingsAndContext(ymir::media::Disc disc) {
     // Insert disc into the Saturn drive
     {
         std::unique_lock lock{m_context.locks.disc};
@@ -175,37 +296,5 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     if (m_context.paused && m_settings.general.unpauseOnDiscLoad) {
         m_context.EnqueueEvent(events::emu::SetPaused(false));
     }
-    return true;
 }
-
-void DiscService::LoadRecentDiscs() {
-    auto listPath = m_context.profile.GetPath(ProfilePath::PersistentState) / "recent_discs.txt";
-    std::ifstream in{listPath};
-    if (!in) {
-        return;
-    }
-
-    m_context.state.recentDiscs.clear();
-    while (in) {
-        std::string line;
-        if (!std::getline(in, line)) {
-            break;
-        }
-        std::u8string u8line{line.begin(), line.end()};
-        std::filesystem::path path = u8line;
-        if (!path.empty()) {
-            m_context.state.recentDiscs.push_back(path);
-        }
-    }
-}
-
-void DiscService::SaveRecentDiscs() {
-    auto listPath = m_context.profile.GetPath(ProfilePath::PersistentState) / "recent_discs.txt";
-    std::ofstream out{listPath};
-    for (auto &path : m_context.state.recentDiscs) {
-        std::u8string u8path = path.u8string();
-        out << reinterpret_cast<const char *>(u8path.data()) << "\n";
-    }
-}
-
 } // namespace app::services
