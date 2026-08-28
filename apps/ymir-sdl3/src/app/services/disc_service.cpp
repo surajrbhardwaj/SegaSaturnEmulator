@@ -63,7 +63,7 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     ymir::media::Disc disc{};
 
     auto showError = [this, path](std::string message) {
-        t_showModal("Error", [this, path, message] {
+        m_showModal("Error", [this, path, message] {
             ImGui::TextUnformatted(fmt::format("Could not load {} as a game disc image.", path).c_str());
             ImGui::NewLine();
             ImGui::TextUnformatted(message.c_str());
@@ -98,7 +98,7 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     };
 
     bool hasErrors = false;
-    if (!ymir::media::LoadDisc(path, disc, settings.general.preloadDiscImagesToRAM,
+    if (!ymir::media::LoadDisc(path, disc, m_settings.general.preloadDiscImagesToRAM,
                                [&](ymir::media::MessageType type, std::string message) {
                                    switch (type) {
                                    case ymir::media::MessageType::InvalidFormat:
@@ -133,13 +133,13 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
         std::unique_lock lock{m_context.locks.disc};
         m_context.saturn.instance->LoadDisc(std::move(disc));
         if (m_context.saturn.GetConfiguration().system.autodetectRegion) {
-            settings.system.videoStandard = m_context.saturn.GetConfiguration().system.videoStandard.Get();
-            settings.MakeDirty();
+            m_settings.system.videoStandard = m_context.saturn.GetConfiguration().system.videoStandard.Get();
+            m_settings.MakeDirty();
         }
     }
 
     // Load new internal backup memory image if using per-game images
-    if (settings.system.internalBackupRAMPerGame) {
+    if (m_settings.system.internalBackupRAMPerGame) {
         m_context.EnqueueEvent(events::emu::LoadInternalBackupMemory());
     }
 
@@ -162,7 +162,7 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     SaveRecentDiscs();
 
     // Load cartridge
-    if (settings.cartridge.autoLoadGameCarts) {
+    if (m_settings.cartridge.autoLoadGameCarts) {
         if (auto *romService = m_context.serviceLocator.Get<ROMService>()) {
             romService->LoadRecommendedCartridge();
         }
@@ -172,7 +172,7 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
 
     m_context.rewindBuffer.Reset();
 
-    if (m_context.paused && settings.general.unpauseOnDiscLoad) {
+    if (m_context.paused && m_settings.general.unpauseOnDiscLoad) {
         m_context.EnqueueEvent(events::emu::SetPaused(false));
     }
     return true;
