@@ -98,6 +98,7 @@
     #include <app/services/gfx/gfx_d3d_utils.hpp>
 #endif
 #include <app/services/gfx/gfx_adapters.hpp>
+#include <app/services/disc_service.hpp>
 
 #include <app/input/input_backend_sdl3.hpp>
 #include <app/input/input_utils.hpp>
@@ -3380,6 +3381,7 @@ void App::EmulatorThread() {
 
     std::array<EmuEvent, 64> evts{};
 
+    std::filesystem::path p;
     while (true) {
         const bool paused = m_context.paused;
         StepAction stepAction = paused ? StepAction::Noop : StepAction::RunFrame;
@@ -3387,15 +3389,16 @@ void App::EmulatorThread() {
         // Process all pending events
         const size_t evtCount = paused ? m_context.eventQueues.emulator.wait_dequeue_bulk(evts.begin(), evts.size())
                                        : m_context.eventQueues.emulator.try_dequeue_bulk(evts.begin(), evts.size());
+        std::cout << evtCount << std::endl;
         for (size_t i = 0; i < evtCount; i++) {
             EmuEvent &evt = evts[i];
             using enum EmuEvent::Type;
             
             switch(m_discService.m_asyncLoadStatus.load()) {
-                case DiscService::DiscLoadStatus::SUCCESS:
-                    m_discService.UpdateSettingsAndContext(m_discService.asyncDisc);
-                case DiscService::DiscLoadStatus::FAIL:
-                    m_discService.m_asyncLoadStatus = DiscService::DiscLoadStatus::DEFAULT;
+                case app::services::DiscService::DiscLoadStatus::SUCCESS:
+                    m_discService.UpdateSettingsAndContext(std::move(m_discService.asyncDisc.value()), p);
+                case app::services::DiscService::DiscLoadStatus::FAIL:
+                    m_discService.m_asyncLoadStatus = app::services::DiscService::DiscLoadStatus::DEFAULT;
                     break;
             }
 
@@ -3474,6 +3477,7 @@ void App::EmulatorThread() {
                 auto &path = std::get<std::filesystem::path>(evt.value);
                 // LoadDiscImage locks the disc mutex
                 m_discService.LoadDiscImageAsync(path, true);
+                p = path;
                 /*
                 if (m_discService.LoadDiscImage(path, true)) {
                     m_saveStateService.LoadSaveStates();

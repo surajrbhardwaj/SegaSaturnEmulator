@@ -9,21 +9,23 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <optional>
 
 namespace app::services {
 
 /// @brief Handles loading disc images and the recent games list.
 class DiscService {
 public:
-    enum class DiskLoadStatus : uint8 {
+    enum class DiscLoadStatus : uint8 {
         DEFAULT = 0,
         SUCCESS = 1,
         FAIL = 2
     };
     
-    std::atomic<DiskLoadStatus> m_asyncLoadStatus;
+    std::atomic<DiscLoadStatus> m_asyncLoadStatus;
     std::thread asyncDiscLoadThread;
-    ymir::media::Disc asyncDisc;
+    std::optional<ymir::media::Disc> asyncDisc;
+    std::filesystem::path asyncPath;
 
     using ShowModalCallback = std::function<void(std::string title, std::function<void()> contents)>;
 
@@ -60,12 +62,11 @@ public:
     /// @brief Saves the list of recent discs to disk.
     void SaveRecentDiscs();
 
+    void UpdateSettingsAndContext(ymir::media::Disc disc, std::filesystem::path path);
 private:
     SharedContext &m_context;
     Settings &m_settings;
     ShowModalCallback m_showModal;
-    
-    void UpdateSettingsAndContext(ymir::media::Disc disc);
 };
 
 } // namespace app::services
