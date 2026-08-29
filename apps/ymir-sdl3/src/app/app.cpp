@@ -3402,9 +3402,11 @@ void App::EmulatorThread() {
                     m_discService.UpdateSettingsAndContext(std::move(m_discService.asyncDisc.value()), p);
                 case app::services::DiscService::DiscLoadStatus::FAIL:
                     m_discService.m_asyncLoadStatus = app::services::DiscService::DiscLoadStatus::DEFAULT;
+                    std::cout << "UpdateSettingsAndContext took " << std::chrono::steady_clock::now()-start << " to run" << std::endl;
                     break;
             }
 
+            start = std::chrono::steady_clock::now();
             switch (evt.type) {
             case FactoryReset:
                 m_context.saturn.instance->FactoryReset();
