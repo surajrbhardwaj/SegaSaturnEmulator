@@ -1729,6 +1729,7 @@ void App::RunEmulator() {
         for (size_t i = 0; i < evtCount; i++) {
             const GUIEvent &evt = evts[i];
             using EvtType = GUIEvent::Type;
+            const auto start = std::chrono::steady_clock::now();
             switch (evt.type) {
             case EvtType::LoadDisc: m_discService.OpenLoadDiscDialog(); break;
             case EvtType::LoadRecommendedGameCartridge: m_romService.LoadRecommendedCartridge(); break;
@@ -1946,6 +1947,7 @@ void App::RunEmulator() {
                 break;
             case EvtType::StateSaved: m_saveStateService.PersistSaveState(std::get<uint32>(evt.value)); break;
             }
+            std::cout << "gui event " << evt << " took " << std::chrono::steady_clock::now()-start << " to run" << std::endl;
         }
 
         // Update display
@@ -3389,11 +3391,12 @@ void App::EmulatorThread() {
         // Process all pending events
         const size_t evtCount = paused ? m_context.eventQueues.emulator.wait_dequeue_bulk(evts.begin(), evts.size())
                                        : m_context.eventQueues.emulator.try_dequeue_bulk(evts.begin(), evts.size());
-        std::cout << evtCount << std::endl;
         for (size_t i = 0; i < evtCount; i++) {
             EmuEvent &evt = evts[i];
             using enum EmuEvent::Type;
             
+            auto start = std::chrono::steady_clock::now();
+
             switch(m_discService.m_asyncLoadStatus.load()) {
                 case app::services::DiscService::DiscLoadStatus::SUCCESS:
                     m_discService.UpdateSettingsAndContext(std::move(m_discService.asyncDisc.value()), p);
@@ -3552,6 +3555,7 @@ void App::EmulatorThread() {
 
             case Shutdown: m_context.saturn.instance->VDP.UseNullRenderer(); return;
             }
+            std::cout << "emu event " << evt << " took " << std::chrono::steady_clock::now()-start << " to run" << std::endl;
         }
 
         // Emulate one frame
