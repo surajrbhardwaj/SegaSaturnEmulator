@@ -143,10 +143,15 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
 
 void DiscService::LoadDiscImageAsync(std::filesystem::path path, bool showErrorModal) {
     // If a disc is being loaded asyncronously, wait until it is done
+    std::lock_guard<std::mutex> lock(threadMutex);
     if(asyncDiscLoadThread.joinable()) {
         asyncDiscLoadThread.join();
         m_asyncLoadStatus = DiscService::DiscLoadStatus::DEFAULT;
     }
+    asyncDiscLoadThread = std::thread(&DiscService::AsyncLoad, this, path, showErrorModal);
+}
+
+void DiscService::AsyncLoad(std::filesystem::path path, bool showErrorModal) {
 
     // Try to load disc image from specified path
     devlog::info<grp::base>("Loading disc image from {}", path);

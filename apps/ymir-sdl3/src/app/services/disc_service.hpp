@@ -23,6 +23,7 @@ public:
     };
     
     std::atomic<DiscLoadStatus> m_asyncLoadStatus;
+    std::mutex threadMutex;
     std::thread asyncDiscLoadThread;
     std::optional<ymir::media::Disc> asyncDisc;
     std::filesystem::path asyncPath;
@@ -67,6 +68,8 @@ private:
     SharedContext &m_context;
     Settings &m_settings;
     ShowModalCallback m_showModal;
+    
+    void AsyncLoad(std::filesystem::path path, bool showErrorModal);
 };
 
 } // namespace app::services
