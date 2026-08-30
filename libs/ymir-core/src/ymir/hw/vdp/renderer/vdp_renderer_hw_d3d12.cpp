@@ -23,8 +23,10 @@
 #include <cmrc/cmrc.hpp>
 CMRC_DECLARE(ymir_core_shaders);
 
+#include <cassert>
 #include <concepts>
 #include <deque>
+#include <unordered_map>
 #include <vector>
 
 using namespace ymir::gpu::d3d12;
@@ -379,107 +381,285 @@ D3D12_SHADER_BYTECODE ToShaderBytecode(const gpu::CompiledShader<stage> &shader)
     };
 }
 
-/// @brief Manages a set of buffer transition barriers and emits them to command lists.
-struct BufferTransitionBarrierSet {
-    BufferTransitionBarrierSet(bool enhancedBarriers)
-        : m_enhancedBarriers(enhancedBarriers) {}
+static constexpr D3D12_BARRIER_SUBRESOURCE_RANGE kTexRangeAll{
+    .IndexOrFirstMipLevel = 0xFFFFFFFF,
+    .NumMipLevels = 0,
+};
 
-    /// @brief Adds a barrier to this set.
+/// @brief Determines if a barrier access grants write access.
+/// NOTE: Only concerned with bits valid for compute tasks.
+/// @param[in] access the access bitmask to check
+/// @return `true` if any of the provided access bits grant write access, `false` if read-only.
+static bool IsBarrierAccessWrite(D3D12_BARRIER_ACCESS access) {
+    return access == D3D12_BARRIER_ACCESS_COMMON ||
+           (access & (D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST));
+}
+
+/// @brief Manages a set of transition barriers and emits them to command lists.
+struct BarrierTracker {
+    /// @brief Configures the use of enhanced barriers.
+    /// @param[in] use whether to use enhanced barriers
+    void UseEnhancedBarriers(bool use) {
+        m_enhancedBarriers = use;
+    }
+
+    /// @brief Registers and initializes state tracking for the given buffer.
+    /// No commands are emitted for this.
+    /// @param[in] resource the buffer resource
+    /// @param[in] state the initial resource state (legacy)
+    /// @param[in] sync the initial barrier sync state
+    /// @param[in] access the initial barrier access mode
+    void InitializeBuffer(ID3D12Resource *resource, D3D12_RESOURCE_STATES state, D3D12_BARRIER_SYNC sync,
+                          D3D12_BARRIER_ACCESS access) {
+        assert(!m_currentBufferStates.contains(resource));
+        assert(resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+        m_currentBufferStates[resource] = {
+            .state = state,
+            .sync = sync,
+            .access = access,
+        };
+    }
+
+    /// @brief Registers and initializes state tracking for the given texture.
+    /// No commands are emitted for this.
+    /// @param[in] resource the buffer resource
+    /// @param[in] state the initial resource state (legacy)
+    /// @param[in] sync the initial barrier sync state
+    /// @param[in] access the initial barrier access mode
+    /// @param[in] layout the initial barrier layout
+    void InitializeTexture(ID3D12Resource *resource, D3D12_RESOURCE_STATES state, D3D12_BARRIER_SYNC sync,
+                           D3D12_BARRIER_ACCESS access, D3D12_BARRIER_LAYOUT layout) {
+        assert(!m_currentTextureStates.contains(resource));
+        assert(resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+               resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+               resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+        m_currentTextureStates[resource] = {
+            .state = state,
+            .sync = sync,
+            .access = access,
+            .layout = layout,
+        };
+    }
+
+    /// @brief Registers a buffer transition.
+    ///
+    /// @param[in] buffer pointer to the buffer resource
+    /// @param[in] newState new resource state to apply
+    /// @param[in] newAccess new access bits corresponding with resource usage to apply
+    /// @param[in] newState new usage bits to apply
+    /// @return this barrier set
+    BarrierTracker &TransitionBuffer(ID3D12Resource *buffer, D3D12_RESOURCE_STATES newState, D3D12_BARRIER_SYNC newSync,
+                                     D3D12_BARRIER_ACCESS newAccess) {
+        m_desiredBufferStates[buffer] = {
+            .state = newState,
+            .sync = newSync,
+            .access = newAccess,
+        };
+        return *this;
+    }
+
+    /// @brief Adds a texture barrier to this set.
     ///
     /// `sync*` and `access*` parameters are used with enhanced barriers, while `state*` parameters are used with legacy
     /// barriers.
     ///
-    /// @param[in] buffer pointer to the buffer resource
-    /// @param[in] size size of the buffer
-    /// @param[in] syncBefore synchronization scope of all preceding GPU work that must be completed before executing
-    /// the barrier
-    /// @param[in] syncAfter synchronization scope of all subsequent GPU work that must wait until the barrier execution
-    /// is finished
-    /// @param[in] accessBefore access bits corresponding with resource usage since the preceding barrier, or the start
-    /// of ExecuteCommandLists scope
-    /// @param[in] accessAfter access bits corresponding with resource usage after the barrier completes
-    /// @param[in] stateBefore usage bits before the resource is transitioned
-    /// @param[in] stateAfter usage bits after the resource is transitioned
+    /// @param[in] texture pointer to the texture resource
+    /// @param[in] newState new resource state to apply
+    /// @param[in] newAccess new access bits corresponding with resource usage to apply
+    /// @param[in] newState new usage bits to apply
+    /// @param[in] newLayout new texture layout to apply
     /// @return this barrier set
-    BufferTransitionBarrierSet &Add(ID3D12Resource *buffer, UINT64 size, D3D12_BARRIER_SYNC syncBefore,
-                                    D3D12_BARRIER_SYNC syncAfter, D3D12_BARRIER_ACCESS accessBefore,
-                                    D3D12_BARRIER_ACCESS accessAfter, D3D12_RESOURCE_STATES stateBefore,
-                                    D3D12_RESOURCE_STATES stateAfter) {
-        m_entries.push_back({buffer, size, syncBefore, syncAfter, accessBefore, accessAfter, stateBefore, stateAfter});
+    BarrierTracker &TransitionTexture(ID3D12Resource *texture, D3D12_RESOURCE_STATES newState,
+                                      D3D12_BARRIER_SYNC newSync, D3D12_BARRIER_ACCESS newAccess,
+                                      D3D12_BARRIER_LAYOUT newLayout) {
+        m_desiredTextureStates[texture] = {
+            .state = newState,
+            .sync = newSync,
+            .access = newAccess,
+            .layout = newLayout,
+        };
         return *this;
     }
 
-    /// @brief Reverses the transition parameters of all barriers registered in this set.
-    /// @return this barrier set
-    BufferTransitionBarrierSet &Reverse() {
-        for (Entry &entry : m_entries) {
-            std::swap(entry.syncBefore, entry.syncAfter);
-            std::swap(entry.accessBefore, entry.accessAfter);
-            std::swap(entry.stateBefore, entry.stateAfter);
-        }
-        return *this;
-    }
-
-    /// @brief Emits a barrier command into the command list using legacy or enhanced barriers.
+    /// @brief Emits a barrier command into the command list if any relevant changes to barriers are detected and
+    /// updates the current states of all affected barriers.
     /// @param[in] cmdList the command list
-    void Emit(D3D12GraphicsCommandList &cmdList) {
-        if (m_entries.empty()) {
-            return;
-        }
-
+    void Flush(D3D12GraphicsCommandList &cmdList) {
         if (auto *enhCmdList = GetCommandListForEnhancedBarriers(cmdList)) {
-            std::vector<D3D12_BUFFER_BARRIER> barriers{m_entries.size()};
-            for (size_t i = 0; i < m_entries.size(); ++i) {
-                const Entry &entry = m_entries[i];
-                barriers[i] = {
-                    .SyncBefore = entry.syncBefore,
-                    .SyncAfter = entry.syncAfter,
-                    .AccessBefore = entry.accessBefore,
-                    .AccessAfter = entry.accessAfter,
-                    .pResource = entry.buffer,
-                    .Offset = 0,
-                    .Size = entry.size,
-                };
+            std::vector<D3D12_BARRIER_GROUP> groups{};
+
+            std::vector<D3D12_BUFFER_BARRIER> bufferBarriers{};
+            for (auto &[buffer, newState] : m_desiredBufferStates) {
+                BufferState oldState{};
+                auto it = m_currentBufferStates.find(buffer);
+                if (it != m_currentBufferStates.end()) {
+                    oldState = it->second;
+                }
+
+                const bool changed = oldState.sync != newState.sync || oldState.access != newState.access;
+                if (!changed) {
+                    continue;
+                }
+
+                // Emit barrier on relevant changes.
+                // Read-after-read does not need a barrier.
+                if (IsBarrierAccessWrite(oldState.access) || IsBarrierAccessWrite(newState.access)) {
+                    bufferBarriers.push_back({
+                        .SyncBefore = oldState.sync,
+                        .SyncAfter = newState.sync,
+                        .AccessBefore = oldState.access,
+                        .AccessAfter = newState.access,
+                        .pResource = buffer,
+                        .Offset = 0,
+                        .Size = UINT64_MAX,
+                    });
+                }
+
+                // Update current state
+                m_currentBufferStates[buffer] = newState;
             }
-            const D3D12_BARRIER_GROUP group{
-                .Type = D3D12_BARRIER_TYPE_BUFFER,
-                .NumBarriers = static_cast<UINT32>(barriers.size()),
-                .pBufferBarriers = barriers.data(),
-            };
-            enhCmdList->Barrier(1, &group);
+            m_desiredBufferStates.clear();
+            if (!bufferBarriers.empty()) {
+                groups.push_back({
+                    .Type = D3D12_BARRIER_TYPE_BUFFER,
+                    .NumBarriers = static_cast<UINT32>(bufferBarriers.size()),
+                    .pBufferBarriers = bufferBarriers.data(),
+                });
+            }
+
+            std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{};
+            for (auto &[texture, newState] : m_desiredTextureStates) {
+                TextureState oldState{};
+                auto it = m_currentTextureStates.find(texture);
+                if (it != m_currentTextureStates.end()) {
+                    oldState = it->second;
+                }
+
+                const bool layoutChanged = oldState.layout != newState.layout;
+                const bool changed =
+                    oldState.sync != newState.sync || oldState.access != newState.access || layoutChanged;
+                if (!changed) {
+                    continue;
+                }
+
+                // Emit barrier on relevant changes
+                // Read-after-read does not need a barrier unless the texture layout changed.
+                if (layoutChanged || IsBarrierAccessWrite(oldState.access) || IsBarrierAccessWrite(newState.access)) {
+                    // Add barrier to list
+                    textureBarriers.push_back({
+                        .SyncBefore = oldState.sync,
+                        .SyncAfter = newState.sync,
+                        .AccessBefore = oldState.access,
+                        .AccessAfter = newState.access,
+                        .LayoutBefore = oldState.layout,
+                        .LayoutAfter = newState.layout,
+                        .pResource = texture,
+                        .Subresources = kTexRangeAll,
+                        .Flags = D3D12_TEXTURE_BARRIER_FLAG_NONE,
+                    });
+                }
+
+                // Update current state
+                m_currentTextureStates[texture] = newState;
+            }
+            m_desiredTextureStates.clear();
+            if (!textureBarriers.empty()) {
+                groups.push_back({
+                    .Type = D3D12_BARRIER_TYPE_TEXTURE,
+                    .NumBarriers = static_cast<UINT32>(textureBarriers.size()),
+                    .pTextureBarriers = textureBarriers.data(),
+                });
+            }
+
+            if (!groups.empty()) {
+                enhCmdList->Barrier(groups.size(), groups.data());
+            }
         } else {
-            std::vector<D3D12_RESOURCE_BARRIER> barriers{m_entries.size()};
-            for (size_t i = 0; i < m_entries.size(); ++i) {
-                const Entry &entry = m_entries[i];
-                barriers[i] = {
+            std::vector<D3D12_RESOURCE_BARRIER> barriers{};
+
+            for (auto &[buffer, newState] : m_desiredBufferStates) {
+                BufferState oldState{};
+                auto it = m_currentBufferStates.find(buffer);
+                if (it != m_currentBufferStates.end()) {
+                    oldState = it->second;
+                }
+
+                if (oldState.state == newState.state) {
+                    // No changes
+                    continue;
+                }
+
+                barriers.push_back({
                     .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
                     .Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
                     .Transition =
                         {
-                            .pResource = entry.buffer,
+                            .pResource = buffer,
                             .Subresource = 0,
-                            .StateBefore = entry.stateBefore,
-                            .StateAfter = entry.stateAfter,
+                            .StateBefore = oldState.state,
+                            .StateAfter = newState.state,
                         },
-                };
+                });
+
+                // Update current state
+                m_currentBufferStates[buffer] = newState;
             }
+            m_desiredBufferStates.clear();
+
+            for (auto &[texture, newState] : m_desiredTextureStates) {
+                TextureState oldState{};
+                auto it = m_currentTextureStates.find(texture);
+                if (it != m_currentTextureStates.end()) {
+                    oldState = it->second;
+                }
+
+                if (oldState.state == newState.state) {
+                    // No changes
+                    continue;
+                }
+
+                barriers.push_back({
+                    .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    .Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    .Transition =
+                        {
+                            .pResource = texture,
+                            .Subresource = 0,
+                            .StateBefore = oldState.state,
+                            .StateAfter = newState.state,
+                        },
+                });
+
+                // Update current state
+                m_currentTextureStates[texture] = newState;
+            }
+            m_desiredTextureStates.clear();
+
             cmdList->ResourceBarrier(barriers.size(), barriers.data());
         }
     }
 
 private:
-    struct Entry {
-        ID3D12Resource *buffer;
-        UINT64 size;
-        D3D12_BARRIER_SYNC syncBefore;
-        D3D12_BARRIER_SYNC syncAfter;
-        D3D12_BARRIER_ACCESS accessBefore;
-        D3D12_BARRIER_ACCESS accessAfter;
-        D3D12_RESOURCE_STATES stateBefore;
-        D3D12_RESOURCE_STATES stateAfter;
-    };
-    std::vector<Entry> m_entries;
     bool m_enhancedBarriers;
+
+    struct BufferState {
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+
+        D3D12_BARRIER_SYNC sync = D3D12_BARRIER_SYNC_ALL;
+        D3D12_BARRIER_ACCESS access = D3D12_BARRIER_ACCESS_COMMON;
+    };
+    std::unordered_map<ID3D12Resource *, BufferState> m_currentBufferStates;
+    std::unordered_map<ID3D12Resource *, BufferState> m_desiredBufferStates;
+
+    struct TextureState {
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+
+        D3D12_BARRIER_SYNC sync = D3D12_BARRIER_SYNC_NONE;
+        D3D12_BARRIER_ACCESS access = D3D12_BARRIER_ACCESS_NO_ACCESS;
+        D3D12_BARRIER_LAYOUT layout = D3D12_BARRIER_LAYOUT_UNDEFINED;
+    };
+    std::unordered_map<ID3D12Resource *, TextureState> m_currentTextureStates;
+    std::unordered_map<ID3D12Resource *, TextureState> m_desiredTextureStates;
 
     /// @brief Retrieves a pointer to the specified command list if enhanced barriers are supported.
     /// @param[in] cmdList the command list
@@ -610,14 +790,15 @@ struct Direct3D12VDPRenderer::Impl {
     //
     // TODO
 
-    struct VDP1FrameContext : public FrameContext {};
-
     struct VDP1Resources {
         /// @brief VDP1 per-frame resources.
-        FrameSet<kNumFrames, VDP1FrameContext> frames;
+        FrameSet<kNumFrames> frames;
 
         /// @brief VDP1 command list.
         D3D12GraphicsCommandList cmdList;
+
+        /// @brief Upload ring buffer.
+        UploadRingBuffer uploadBuffer;
     } vdp1;
 
     // =================================================================================================================
@@ -1099,7 +1280,7 @@ struct Direct3D12VDPRenderer::Impl {
         // Blend mode
         //   0 = alpha
         //   1 = additive
-        HLSLuint blendMode;
+        HLSLbool useAdditiveBlend;
 
         // Use second screen ratio
         HLSLbool useSecondScreenRatio;
@@ -1187,8 +1368,6 @@ struct Direct3D12VDPRenderer::Impl {
     /// The second half of CRAM can be used for that purpose.
     static constexpr UINT kVDP2CRAMRotCoeffBufferSize = kVDP2CRAMSize / 2;
 
-    struct VDP2FrameContext : public FrameContext {};
-
     struct VDP2Resources {
         VDP2Resources(const config::VDP2AccessPatternsConfig &accessPatternsConfig,
                       const config::VDP2DebugRender &debugRenderOptions)
@@ -1196,7 +1375,7 @@ struct Direct3D12VDPRenderer::Impl {
             , debugRenderOptions(debugRenderOptions) {}
 
         /// @brief VDP2 per-frame resources.
-        FrameSet<kNumFrames, VDP2FrameContext> frames;
+        FrameSet<kNumFrames> frames;
 
         /// @brief VDP2 command list.
         D3D12GraphicsCommandList cmdList;
@@ -1264,6 +1443,13 @@ struct Direct3D12VDPRenderer::Impl {
         /// @brief RBG0-1 line color outputs UAV (offline).
         DescriptorRange rbgLineColorOutUAV;
 
+        /// @brief Color calculation window 2D texture.
+        D3D12Resource colorCalcWindowTexture;
+        /// @brief Color calculation window SRV (offline).
+        DescriptorRange colorCalcWindowSRV;
+        /// @brief Color calculation window UAV (offline).
+        DescriptorRange colorCalcWindowUAV;
+
         /// @brief LNCL/BACK screen buffer.
         D3D12Resource lnclBackBuffer;
         /// @brief LNCL/BACK screen buffer SRV (offline).
@@ -1291,6 +1477,13 @@ struct Direct3D12VDPRenderer::Impl {
         DescriptorRange rotParamStatesSRV;
         /// @brief VDP2 rotation parameter states buffer UAV (offline).
         DescriptorRange rotParamStatesUAV;
+
+        /// @brief VDP2 sprite attributes 2D texture array (sprite then mesh).
+        D3D12Resource spriteAttrsTexture;
+        /// @brief VDP2 sprite attributes SRV (offline).
+        DescriptorRange spriteAttrsSRV;
+        /// @brief VDP2 sprite attributes UAV (offline).
+        DescriptorRange spriteAttrsUAV;
 
         /// @brief 2D texture for the composited VDP2 output.
         D3D12Resource compositeOutTexture;
@@ -1325,6 +1518,15 @@ struct Direct3D12VDPRenderer::Impl {
         /// @brief Descriptor range for calculating rotation parameters.
         DescriptorRange calcRotParamsDescs;
 
+        /// @brief Compute shader for drawing the sprite layer.
+        gpu::ComputeShader drawSpriteShader;
+        /// @brief Root signature for drawing the sprite layer.
+        D3D12RootSignature drawSpriteRootSig;
+        /// @brief Pipeline state object for drawing the sprite layer.
+        D3D12PipelineState drawSpritePSO;
+        /// @brief Descriptor range for drawing the sprite layer.
+        DescriptorRange drawSpriteDescs;
+
         /// @brief Compute shader for drawing background layers.
         gpu::ComputeShader drawBGsShader;
         /// @brief Root signature for drawing background layers.
@@ -1349,6 +1551,8 @@ struct Direct3D12VDPRenderer::Impl {
         uint32 nextLayerRenderLine = 0;
         uint32 nextComposeLine = 0;
 
+        BarrierTracker barrierTracker;
+
         bool rotRegsDirty = false;
         bool layerRenderParamsDirty = false;
         bool composeParamsDirty = false;
@@ -1370,6 +1574,7 @@ struct Direct3D12VDPRenderer::Impl {
         } else {
             features.enhancedBarriers = false;
         }
+        vdp2.barrierTracker.UseEnhancedBarriers(features.enhancedBarriers);
 
         // Main command queue
         if (HRESULT hr = cmdQueue.Create(device, D3D12_COMMAND_LIST_TYPE_COMPUTE); FAILED(hr)) {
@@ -1426,11 +1631,21 @@ struct Direct3D12VDPRenderer::Impl {
         }
         vdp1.cmdList->SetName(L"[Ymir-VDP1] Command list");
 
+        // Generic VDP1 upload buffer
+        {
+            if (auto result = vdp1.uploadBuffer.Create(device, kUploadBufferSize); !result) {
+                return util::ErrorMessage{
+                    fmt::format("Could not create VDP1 upload buffer: {}", result.Error().message)};
+            }
+            vdp1.uploadBuffer.SetDebugName("VDP1");
+            vdp1.uploadBuffer.GetBufferResource()->SetName(L"[Ymir-VDP1] Upload buffer");
+        }
+
         // -------------------------------------------------------------------------------------------------------------
 
         // VDP2 command allocators and list
         for (int i = 0; i < vdp2.frames.Count(); ++i) {
-            VDP2FrameContext &frame = vdp2.frames[i];
+            FrameContext &frame = vdp2.frames[i];
             if (HRESULT hr = frame.cmdAlloc.Create(device, D3D12_COMMAND_LIST_TYPE_COMPUTE); FAILED(hr)) {
                 return util::ErrorMessage{fmt::format(
                     "Could not create VDP2 renderer command allocator #{}, error code {:X}", i, (uint32)hr)};
@@ -1464,6 +1679,10 @@ struct Direct3D12VDPRenderer::Impl {
             }
             vdp2.vramBuffer->SetName(L"[Ymir-VDP2] VRAM buffer");
 
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.vramBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+
             if (!offlineHeapAlloc.Allocate(vdp2.vramSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 VRAM buffer SRV"};
             }
@@ -1490,6 +1709,10 @@ struct Direct3D12VDPRenderer::Impl {
                     fmt::format("Could not create VDP2 CRAM color buffer, error code {:X}", (uint32)hr)};
             }
             vdp2.cramColorBuffer->SetName(L"[Ymir-VDP2] CRAM color buffer");
+
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.cramColorBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
 
             if (!offlineHeapAlloc.Allocate(vdp2.cramColorSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 CRAM color buffer SRV"};
@@ -1518,6 +1741,10 @@ struct Direct3D12VDPRenderer::Impl {
                     "Could not create VDP2 CRAM rotation coefficients buffer, error code {:X}", (uint32)hr)};
             }
             vdp2.cramRotCoeffBuffer->SetName(L"[Ymir-VDP2] CRAM rotation coefficients buffer");
+
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.cramRotCoeffBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
 
             if (!offlineHeapAlloc.Allocate(vdp2.cramRotCoeffSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 CRAM rotation coefficients buffer SRV"};
@@ -1563,6 +1790,10 @@ struct Direct3D12VDPRenderer::Impl {
                     fmt::format("Could not create layer outputs texture array, error code {:X}", (uint32)hr)};
             }
             vdp2.layerOutTexture->SetName(L"[Ymir-VDP2] Layer outputs texture array");
+
+            vdp2.barrierTracker.InitializeTexture(
+                vdp2.layerOutTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
 
             if (!offlineHeapAlloc.Allocate(vdp2.layerOutSRV)) {
                 return util::ErrorMessage{"Could not allocate layer outputs texture array SRV"};
@@ -1615,6 +1846,10 @@ struct Direct3D12VDPRenderer::Impl {
             }
             vdp2.rbgLineColorOutTexture->SetName(L"[Ymir-VDP2] RBG line color outputs texture array");
 
+            vdp2.barrierTracker.InitializeTexture(
+                vdp2.rbgLineColorOutTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
+
             if (!offlineHeapAlloc.Allocate(vdp2.rbgLineColorOutSRV)) {
                 return util::ErrorMessage{"Could not allocate RBG line color outputs texture array SRV"};
             }
@@ -1636,7 +1871,7 @@ struct Direct3D12VDPRenderer::Impl {
                                              vdp2.rbgLineColorOutSRV.cpuHandle);
 
             if (!offlineHeapAlloc.Allocate(vdp2.rbgLineColorOutUAV)) {
-                return util::ErrorMessage{"Could not allocate layer outputs texture array UAV"};
+                return util::ErrorMessage{"Could not allocate RBG line color outputs texture array UAV"};
             }
             const D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{
                 .Format = kFormat,
@@ -1653,6 +1888,57 @@ struct Direct3D12VDPRenderer::Impl {
                                               vdp2.rbgLineColorOutUAV.cpuHandle);
         }
 
+        // Color calculation window texture
+        {
+            static constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R8_UINT;
+
+            auto builder = vdp2.colorCalcWindowTexture.Texture2DBuilder(kMaxResH, kMaxResV);
+            builder.Format(kFormat);
+            builder.Flags(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            if (HRESULT hr = builder.BuildCommitted(device); FAILED(hr)) {
+                return util::ErrorMessage{
+                    fmt::format("Could not create color calculation window texture, error code {:X}", (uint32)hr)};
+            }
+            vdp2.colorCalcWindowTexture->SetName(L"[Ymir-VDP2] Color calculation window texture");
+
+            vdp2.barrierTracker.InitializeTexture(
+                vdp2.colorCalcWindowTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
+
+            if (!offlineHeapAlloc.Allocate(vdp2.colorCalcWindowSRV)) {
+                return util::ErrorMessage{"Could not allocate color calculation window texture SRV"};
+            }
+            const D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{
+                .Format = kFormat,
+                .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+                .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .Texture2D =
+                    {
+                        .MostDetailedMip = 0,
+                        .MipLevels = 1,
+                        .PlaneSlice = 0,
+                        .ResourceMinLODClamp = 0.0f,
+                    },
+            };
+            device->CreateShaderResourceView(vdp2.colorCalcWindowTexture.GetPointer(), &srvDesc,
+                                             vdp2.colorCalcWindowSRV.cpuHandle);
+
+            if (!offlineHeapAlloc.Allocate(vdp2.colorCalcWindowUAV)) {
+                return util::ErrorMessage{"Could not allocate color calculation window texture UAV"};
+            }
+            const D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{
+                .Format = kFormat,
+                .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D,
+                .Texture2D =
+                    {
+                        .MipSlice = 0,
+                        .PlaneSlice = 0,
+                    },
+            };
+            device->CreateUnorderedAccessView(vdp2.colorCalcWindowTexture.GetPointer(), nullptr, &uavDesc,
+                                              vdp2.colorCalcWindowUAV.cpuHandle);
+        }
+
         // LNCL/BACK screen buffer
         {
             static constexpr size_t kNumEntries = 2 * kMaxResV;
@@ -1663,6 +1949,10 @@ struct Direct3D12VDPRenderer::Impl {
                     fmt::format("Could not create LNCL/BACK screen buffer, error code {:X}", (uint32)hr)};
             }
             vdp2.lnclBackBuffer->SetName(L"[Ymir-VDP2] LNCL/BACK screen buffer");
+
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.lnclBackBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
 
             if (!offlineHeapAlloc.Allocate(vdp2.lnclBackSRV)) {
                 return util::ErrorMessage{"Could not allocate LNCL/BACK screen buffer SRV"};
@@ -1695,6 +1985,12 @@ struct Direct3D12VDPRenderer::Impl {
             }
             vdp2.compositeOutTexture->SetName(L"[Ymir-VDP2] Composited output texture");
 
+            // TODO: initialize barrier tracking for this resource if needed
+            // vdp2.barrierTracker.InitializeTexture(
+            //     vdp2.compositeOutTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            //     D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+            //     D3D12_BARRIER_LAYOUT_COMMON);
+
             if (!offlineHeapAlloc.Allocate(vdp2.compositeOutUAV)) {
                 return util::ErrorMessage{"Could not create composited output texture UAV"};
             }
@@ -1719,6 +2015,10 @@ struct Direct3D12VDPRenderer::Impl {
                     fmt::format("Could not create VDP2 rotation registers buffer, error code {:X}", (uint32)hr)};
             }
             vdp2.rotRegsBuffer->SetName(L"[Ymir-VDP2] Rotation registers buffer");
+
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.rotRegsBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
 
             if (!offlineHeapAlloc.Allocate(vdp2.rotRegsSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 rotation registers buffer SRV"};
@@ -1747,6 +2047,10 @@ struct Direct3D12VDPRenderer::Impl {
                     "Could not create VDP2 rotation parameter base values buffer, error code {:X}", (uint32)hr)};
             }
             vdp2.rotParamBasesBuffer->SetName(L"[Ymir-VDP2] Rotation parameter base values buffer");
+
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.rotParamBasesBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
 
             if (!offlineHeapAlloc.Allocate(vdp2.rotParamBasesSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 rotation parameter base values buffer SRV"};
@@ -1777,6 +2081,10 @@ struct Direct3D12VDPRenderer::Impl {
                     fmt::format("Could not create VDP2 rotation parameter states buffer, error code {:X}", (uint32)hr)};
             }
             vdp2.rotParamStatesBuffer->SetName(L"[Ymir-VDP2] Rotation parameter states buffer");
+
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.rotParamStatesBuffer.GetPointer(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
 
             if (!offlineHeapAlloc.Allocate(vdp2.rotParamStatesSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 rotation parameter states buffer SRV"};
@@ -1815,6 +2123,62 @@ struct Direct3D12VDPRenderer::Impl {
                                               vdp2.rotParamStatesUAV.cpuHandle);
         }
 
+        // VDP2 sprite attributes 2D texture array
+        {
+            static constexpr UINT16 kNumLayers = 2;
+            static constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R8_UINT;
+
+            auto builder = vdp2.spriteAttrsTexture.Texture2DBuilder(kMaxResH, kMaxResV, kNumLayers);
+            builder.Format(kFormat);
+            builder.Flags(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            if (HRESULT hr = builder.BuildCommitted(device); FAILED(hr)) {
+                return util::ErrorMessage{
+                    fmt::format("Could not create sprite attributes texture array, error code {:X}", (uint32)hr)};
+            }
+            vdp2.spriteAttrsTexture->SetName(L"[Ymir-VDP2] Sprite attributes texture array");
+
+            vdp2.barrierTracker.InitializeTexture(
+                vdp2.spriteAttrsTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
+
+            if (!offlineHeapAlloc.Allocate(vdp2.spriteAttrsSRV)) {
+                return util::ErrorMessage{"Could not allocate sprite attributes texture array SRV"};
+            }
+            const D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{
+                .Format = kFormat,
+                .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .Texture2DArray =
+                    {
+                        .MostDetailedMip = 0,
+                        .MipLevels = 1,
+                        .FirstArraySlice = 0,
+                        .ArraySize = kNumLayers,
+                        .PlaneSlice = 0,
+                        .ResourceMinLODClamp = 0.0f,
+                    },
+            };
+            device->CreateShaderResourceView(vdp2.spriteAttrsTexture.GetPointer(), &srvDesc,
+                                             vdp2.spriteAttrsSRV.cpuHandle);
+
+            if (!offlineHeapAlloc.Allocate(vdp2.spriteAttrsUAV)) {
+                return util::ErrorMessage{"Could not allocate sprite attributes texture array UAV"};
+            }
+            const D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{
+                .Format = kFormat,
+                .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                .Texture2DArray =
+                    {
+                        .MipSlice = 0,
+                        .FirstArraySlice = 0,
+                        .ArraySize = kNumLayers,
+                        .PlaneSlice = 0,
+                    },
+            };
+            device->CreateUnorderedAccessView(vdp2.spriteAttrsTexture.GetPointer(), nullptr, &uavDesc,
+                                              vdp2.spriteAttrsUAV.cpuHandle);
+        }
+
         // VDP2 layer rendering parameters buffer
         {
             auto builder = vdp2.layerRenderParamsBuffer.BufferBuilder(sizeof(vdp2.cpuLayerRenderParams));
@@ -1823,6 +2187,10 @@ struct Direct3D12VDPRenderer::Impl {
                     "Could not create VDP2 layer rendering parameters buffer, error code {:X}", (uint32)hr)};
             }
             vdp2.layerRenderParamsBuffer->SetName(L"[Ymir-VDP2] Layer rendering parameters buffer");
+
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.layerRenderParamsBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
 
             if (!offlineHeapAlloc.Allocate(vdp2.layerRenderParamsSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 layer rendering parameters buffer SRV"};
@@ -1852,6 +2220,10 @@ struct Direct3D12VDPRenderer::Impl {
             }
             vdp2.composeParamsBuffer->SetName(L"[Ymir-VDP2] Layer compositing parameters buffer");
 
+            vdp2.barrierTracker.InitializeBuffer(
+                vdp2.composeParamsBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+
             if (!offlineHeapAlloc.Allocate(vdp2.composeParamsSRV)) {
                 return util::ErrorMessage{"Could not allocate VDP2 layer compositing parameters buffer SRV"};
             }
@@ -1873,7 +2245,7 @@ struct Direct3D12VDPRenderer::Impl {
 
         // Build shader, PSO and related resources for calculating rotparams
         {
-            auto shaderBlobResult = LoadShader("src/vdp/vdp2_calc_rotparams_cs.cso");
+            auto shaderBlobResult = LoadShader("src/vdp/cs_vdp2_calc_rotparams.cso");
             if (!shaderBlobResult) {
                 return util::ErrorMessage{
                     fmt::format("Could not load VDP2 rotation parameters calculation compute shader: {}",
@@ -1927,9 +2299,65 @@ struct Direct3D12VDPRenderer::Impl {
                                     std::size(srcHandles), srcHandles, srcSizes.data(), resourceHeap.GetHeapType());
         }
 
+        // Build shader, PSO and related resources for drawing the sprite layer
+        {
+            auto shaderBlobResult = LoadShader("src/vdp/cs_vdp2_render_sprite.cso");
+            if (!shaderBlobResult) {
+                return util::ErrorMessage{fmt::format("Could not load VDP2 sprite layer drawing compute shader: {}",
+                                                      shaderBlobResult.Error().message)};
+            }
+            vdp2.drawSpriteShader.format = gpu::ShaderBytecodeFormat::DXIL;
+            vdp2.drawSpriteShader.bytecode = shaderBlobResult.Value();
+            vdp2.drawSpriteShader.entrypoint = kCSEntrypoint;
+            auto result = gpu::ValidateShader(vdp2.drawSpriteShader);
+            if (!result) {
+                return util::ErrorMessage{fmt::format("VDP2 sprite layer drawing compute shader validation failed: {}",
+                                                      result.Error().message)};
+            }
+
+            auto rootSigBuilder = vdp2.drawSpriteRootSig.Builder();
+            rootSigBuilder.Add32BitConstants(0, sizeof(VDP2CommonRenderParams) / sizeof(uint32));
+            rootSigBuilder.AddDescriptorTable()
+                .AddSRVs(4, 1) // NOTE: starting from 1 because SPIRV-Cross assumes buffers in t0 are constant
+                .AddUAVs(2, 0);
+            if (HRESULT hr = rootSigBuilder.Build(device); FAILED(hr)) {
+                return util::ErrorMessage{fmt::format(
+                    "Could not build VDP2 sprite layer drawing root signature, error code {:X}", (uint32)hr)};
+            }
+            vdp2.drawSpriteRootSig->SetName(L"[Ymir-VDP2] Sprite layer drawing root signature");
+
+            const D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{
+                .pRootSignature = vdp2.drawSpriteRootSig.GetPointer(),
+                .CS = ToShaderBytecode(vdp2.drawSpriteShader),
+            };
+            if (HRESULT hr = vdp2.drawSpritePSO.CreateCompute(device, psoDesc); FAILED(hr)) {
+                return util::ErrorMessage{fmt::format(
+                    "Could not build VDP2 sprite layer drawing pipeline state object, error code {:X}", (uint32)hr)};
+            }
+            vdp2.drawSpritePSO->SetName(L"[Ymir-VDP2] Sprite layer drawing pipeline state object");
+
+            const D3D12_CPU_DESCRIPTOR_HANDLE srcHandles[] = {
+                vdp2.layerRenderParamsSRV.cpuHandle,
+                vdp2.vramSRV.cpuHandle,
+                vdp2.cramColorSRV.cpuHandle,
+                vdp2.rotParamStatesSRV.cpuHandle,
+                /* TODO: vdp1.spriteFBSRV.cpuHandle,*/ vdp2.layerOutUAV.cpuHandle,
+                vdp2.spriteAttrsUAV.cpuHandle,
+            };
+            std::array<UINT, std::size(srcHandles)> srcSizes{};
+            srcSizes.fill(1);
+
+            if (!resourceHeapAlloc.Allocate(vdp2.drawSpriteDescs, std::size(srcHandles))) {
+                return util::ErrorMessage{"Could not allocate VDP2 sprite layer drawing descriptors"};
+            }
+
+            device->CopyDescriptors(1, &vdp2.drawSpriteDescs.cpuHandle, &vdp2.drawSpriteDescs.count,
+                                    std::size(srcHandles), srcHandles, srcSizes.data(), resourceHeap.GetHeapType());
+        }
+
         // Build shader, PSO and related resources for drawing layers
         {
-            auto shaderBlobResult = LoadShader("src/vdp/vdp2_render_bgs_cs.cso");
+            auto shaderBlobResult = LoadShader("src/vdp/cs_vdp2_render_bgs.cso");
             if (!shaderBlobResult) {
                 return util::ErrorMessage{fmt::format("Could not load VDP2 layer rendering compute shader: {}",
                                                       shaderBlobResult.Error().message)};
@@ -1946,8 +2374,8 @@ struct Direct3D12VDPRenderer::Impl {
             auto rootSigBuilder = vdp2.drawBGsRootSig.Builder();
             rootSigBuilder.Add32BitConstants(0, sizeof(VDP2CommonRenderParams) / sizeof(uint32));
             rootSigBuilder.AddDescriptorTable()
-                .AddSRVs(5, 1) // NOTE: starting from 1 because SPIRV-Cross assumes buffers in t0 are constant
-                .AddUAVs(2, 0);
+                .AddSRVs(6, 1) // NOTE: starting from 1 because SPIRV-Cross assumes buffers in t0 are constant
+                .AddUAVs(3, 0);
             if (HRESULT hr = rootSigBuilder.Build(device); FAILED(hr)) {
                 return util::ErrorMessage{
                     fmt::format("Could not build VDP2 layer rendering root signature, error code {:X}", (uint32)hr)};
@@ -1965,9 +2393,15 @@ struct Direct3D12VDPRenderer::Impl {
             vdp2.drawBGsPSO->SetName(L"[Ymir-VDP2] Layer rendering pipeline state object");
 
             const D3D12_CPU_DESCRIPTOR_HANDLE srcHandles[] = {
-                vdp2.layerRenderParamsSRV.cpuHandle, vdp2.rotRegsSRV.cpuHandle,        vdp2.vramSRV.cpuHandle,
-                vdp2.cramColorSRV.cpuHandle,         vdp2.rotParamStatesSRV.cpuHandle, vdp2.layerOutUAV.cpuHandle,
+                vdp2.layerRenderParamsSRV.cpuHandle,
+                vdp2.rotRegsSRV.cpuHandle,
+                vdp2.vramSRV.cpuHandle,
+                vdp2.cramColorSRV.cpuHandle,
+                vdp2.rotParamStatesSRV.cpuHandle,
+                vdp2.spriteAttrsSRV.cpuHandle,
+                vdp2.layerOutUAV.cpuHandle,
                 vdp2.rbgLineColorOutUAV.cpuHandle,
+                vdp2.colorCalcWindowUAV.cpuHandle,
             };
             std::array<UINT, std::size(srcHandles)> srcSizes{};
             srcSizes.fill(1);
@@ -1982,7 +2416,7 @@ struct Direct3D12VDPRenderer::Impl {
 
         // Build shader, PSO and related resources for compositing layers
         {
-            auto shaderBlobResult = LoadShader("src/vdp/vdp2_compose_cs.cso");
+            auto shaderBlobResult = LoadShader("src/vdp/cs_vdp2_compose.cso");
             if (!shaderBlobResult) {
                 return util::ErrorMessage{fmt::format("Could not load VDP2 layer compositing compute shader: {}",
                                                       shaderBlobResult.Error().message)};
@@ -1999,7 +2433,7 @@ struct Direct3D12VDPRenderer::Impl {
             auto rootSigBuilder = vdp2.composeRootSig.Builder();
             rootSigBuilder.Add32BitConstants(0, sizeof(VDP2CommonRenderParams) / sizeof(uint32));
             rootSigBuilder.AddDescriptorTable()
-                .AddSRVs(4, 1) // NOTE: starting from 1 because SPIRV-Cross assumes buffers in t0 are constant
+                .AddSRVs(6, 1) // NOTE: starting from 1 because SPIRV-Cross assumes buffers in t0 are constant
                 .AddUAVs(1, 0);
             if (HRESULT hr = rootSigBuilder.Build(device); FAILED(hr)) {
                 return util::ErrorMessage{
@@ -2018,8 +2452,9 @@ struct Direct3D12VDPRenderer::Impl {
             vdp2.composePSO->SetName(L"[Ymir-VDP2] Layer compositing pipeline state object");
 
             const D3D12_CPU_DESCRIPTOR_HANDLE srcHandles[] = {
-                vdp2.composeParamsSRV.cpuHandle,   vdp2.layerOutSRV.cpuHandle,     vdp2.lnclBackSRV.cpuHandle,
-                vdp2.rbgLineColorOutSRV.cpuHandle, vdp2.compositeOutUAV.cpuHandle,
+                vdp2.composeParamsSRV.cpuHandle,   vdp2.layerOutSRV.cpuHandle,    vdp2.lnclBackSRV.cpuHandle,
+                vdp2.rbgLineColorOutSRV.cpuHandle, vdp2.spriteAttrsSRV.cpuHandle, vdp2.colorCalcWindowSRV.cpuHandle,
+                vdp2.compositeOutUAV.cpuHandle,
             };
             std::array<UINT, std::size(srcHandles)> srcSizes{};
             srcSizes.fill(1);
@@ -2275,14 +2710,13 @@ struct Direct3D12VDPRenderer::Impl {
             return {};
         }
 
+        ID3D12Resource *dstResource = vdp2.vramBuffer.GetPointer();
         ID3D12Resource *uploadBufferPtr = vdp2.uploadBuffer.GetBufferResource().GetPointer();
 
-        BufferTransitionBarrierSet barrier{features.enhancedBarriers};
-        barrier.Add(uploadBufferPtr, vdp2.uploadBuffer.GetSize(),                //
-                    D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                    D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        barrier.Emit(vdp2.cmdList);
+        // Emit barrier transition
+        vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                             D3D12_BARRIER_ACCESS_COPY_DEST);
+        vdp2.barrierTracker.Flush(vdp2.cmdList);
 
         // Upload all modified VRAM chunks
         size_t pos, count = 0;
@@ -2299,12 +2733,9 @@ struct Direct3D12VDPRenderer::Impl {
 
             // Upload VRAM chunk
             memcpy(alloc.data, &vdpState.mem2.VRAM[vramOffset], size);
-            vdp2.cmdList->CopyBufferRegion(vdp2.vramBuffer.GetPointer(), vramOffset, uploadBufferPtr, alloc.offset,
-                                           size);
+            vdp2.cmdList->CopyBufferRegion(dstResource, vramOffset, uploadBufferPtr, alloc.offset, size);
         }
         vdp2.vramDirty.ClearAll();
-
-        barrier.Reverse().Emit(vdp2.cmdList);
 
         return {};
     }
@@ -2316,14 +2747,8 @@ struct Direct3D12VDPRenderer::Impl {
         vdp2.cramDirty = false;
 
         ID3D12Resource *uploadBufferPtr = vdp2.uploadBuffer.GetBufferResource().GetPointer();
-        UploadAllocation alloc{};
 
-        BufferTransitionBarrierSet barrier{features.enhancedBarriers};
-        barrier.Add(uploadBufferPtr, vdp2.uploadBuffer.GetSize(),                //
-                    D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                    D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        barrier.Emit(vdp2.cmdList);
+        UploadAllocation alloc{};
 
         // Update color cache
         {
@@ -2335,6 +2760,12 @@ struct Direct3D12VDPRenderer::Impl {
             memcpy(alloc.data, vdp2.cpuCRAMColorCache.data(), size);
 
             ID3D12Resource *dstResource = vdp2.cramColorBuffer.GetPointer();
+
+            // Emit barrier transition
+            vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                                 D3D12_BARRIER_ACCESS_COPY_DEST);
+            vdp2.barrierTracker.Flush(vdp2.cmdList);
+
             vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
         }
 
@@ -2350,10 +2781,14 @@ struct Direct3D12VDPRenderer::Impl {
             memcpy(alloc.data, &vdpState.mem2.CRAM[kVDP2CRAMSize / 2], size);
 
             ID3D12Resource *dstResource = vdp2.cramRotCoeffBuffer.GetPointer();
+
+            // Emit barrier transition
+            vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                                 D3D12_BARRIER_ACCESS_COPY_DEST);
+            vdp2.barrierTracker.Flush(vdp2.cmdList);
+
             vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
         }
-
-        barrier.Reverse().Emit(vdp2.cmdList);
 
         return {};
     }
@@ -2439,7 +2874,8 @@ struct Direct3D12VDPRenderer::Impl {
         params.enhancements.deinterlace = enhancements.deinterlace;
         params.enhancements.transparentMeshes = enhancements.transparentMeshes;
 
-        // NOTE: this is uploaded as 32-bit root constants, not through the upload buffer
+        // NOTE: this is uploaded as 32-bit root constants, not through the upload buffer.
+        // No uploads or barriers are needed here.
     }
 
     util::VoidResult<> VDP2UpdateLayerRenderParams() {
@@ -2599,17 +3035,10 @@ struct Direct3D12VDPRenderer::Impl {
 
         // Update buffer
         {
+            ID3D12Resource *dstResource = vdp2.layerRenderParamsBuffer.GetPointer();
             ID3D12Resource *uploadBufferPtr = vdp2.uploadBuffer.GetBufferResource().GetPointer();
-            UploadAllocation alloc{};
-
-            BufferTransitionBarrierSet barrier{features.enhancedBarriers};
-            barrier.Add(uploadBufferPtr, vdp2.uploadBuffer.GetSize(),                //
-                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                        D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-            barrier.Emit(vdp2.cmdList);
-
             const size_t size = sizeof(vdp2.cpuLayerRenderParams);
+            UploadAllocation alloc{};
             if (auto result = VDP2AllocateUploadBuffer(size, 4, alloc); !result) {
                 return util::ErrorMessage{
                     fmt::format("Failed to allocate upload buffer for VDP2 layer rendering parameters: {}",
@@ -2617,10 +3046,12 @@ struct Direct3D12VDPRenderer::Impl {
             }
             memcpy(alloc.data, &vdp2.cpuLayerRenderParams, size);
 
-            ID3D12Resource *dstResource = vdp2.layerRenderParamsBuffer.GetPointer();
-            vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
+            // Emit barrier transition
+            vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                                 D3D12_BARRIER_ACCESS_COPY_DEST);
+            vdp2.barrierTracker.Flush(vdp2.cmdList);
 
-            barrier.Reverse().Emit(vdp2.cmdList);
+            vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
         }
 
         return {};
@@ -2668,27 +3099,23 @@ struct Direct3D12VDPRenderer::Impl {
 
         // Update buffer
         {
+            ID3D12Resource *dstResource = vdp2.rotRegsBuffer.GetPointer();
             ID3D12Resource *uploadBufferPtr = vdp2.uploadBuffer.GetBufferResource().GetPointer();
-            UploadAllocation alloc{};
-
-            BufferTransitionBarrierSet barrier{features.enhancedBarriers};
-            barrier.Add(uploadBufferPtr, vdp2.uploadBuffer.GetSize(),                //
-                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                        D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-            barrier.Emit(vdp2.cmdList);
-
             const size_t size = sizeof(vdp2.cpuRotRegs);
+
+            UploadAllocation alloc{};
             if (auto result = VDP2AllocateUploadBuffer(size, 4, alloc); !result) {
                 return util::ErrorMessage{fmt::format(
                     "Failed to allocate upload buffer for VDP2 rotation registers: {}", result.Error().message)};
             }
             memcpy(alloc.data, &vdp2.cpuRotRegs, size);
 
-            ID3D12Resource *dstResource = vdp2.rotRegsBuffer.GetPointer();
-            vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
+            // Emit barrier transition
+            vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                                 D3D12_BARRIER_ACCESS_COPY_DEST);
+            vdp2.barrierTracker.Flush(vdp2.cmdList);
 
-            barrier.Reverse().Emit(vdp2.cmdList);
+            vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
         }
 
         return {};
@@ -2714,7 +3141,7 @@ struct Direct3D12VDPRenderer::Impl {
                                  | (regs2.lineScreenParams.colorCalcEnable << 7) //
             ;
         params.extendedColorCalc = regs2.colorCalcParams.extendedColorCalcEnable && regs2.TVMD.HRESOn < 2;
-        params.blendMode = regs2.colorCalcParams.useAdditiveBlend;
+        params.useAdditiveBlend = regs2.colorCalcParams.useAdditiveBlend;
         params.useSecondScreenRatio = regs2.colorCalcParams.useSecondScreenRatio;
         params.colorOffsetEnable = PackBools<HLSLuint>(regs2.colorOffsetEnable);
         params.colorOffsetSelect = PackBools<HLSLuint>(regs2.colorOffsetSelect);
@@ -2743,17 +3170,11 @@ struct Direct3D12VDPRenderer::Impl {
 
         // Update buffer
         {
+            ID3D12Resource *dstResource = vdp2.composeParamsBuffer.GetPointer();
             ID3D12Resource *uploadBufferPtr = vdp2.uploadBuffer.GetBufferResource().GetPointer();
-            UploadAllocation alloc{};
-
-            BufferTransitionBarrierSet barrier{features.enhancedBarriers};
-            barrier.Add(uploadBufferPtr, vdp2.uploadBuffer.GetSize(),                //
-                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                        D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-            barrier.Emit(vdp2.cmdList);
-
             const size_t size = sizeof(vdp2.cpuComposeParams);
+
+            UploadAllocation alloc{};
             if (auto result = VDP2AllocateUploadBuffer(size, 4, alloc); !result) {
                 return util::ErrorMessage{
                     fmt::format("Failed to allocate upload buffer for VDP2 layer compositing parameters: {}",
@@ -2761,10 +3182,12 @@ struct Direct3D12VDPRenderer::Impl {
             }
             memcpy(alloc.data, &vdp2.cpuComposeParams, size);
 
-            ID3D12Resource *dstResource = vdp2.composeParamsBuffer.GetPointer();
-            vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
+            // Emit barrier transition
+            vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                                 D3D12_BARRIER_ACCESS_COPY_DEST);
+            vdp2.barrierTracker.Flush(vdp2.cmdList);
 
-            barrier.Reverse().Emit(vdp2.cmdList);
+            vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
         }
 
         return {};
@@ -2829,27 +3252,23 @@ struct Direct3D12VDPRenderer::Impl {
     }
 
     util::VoidResult<> VDP2UploadLineColorBackScreens() {
+        ID3D12Resource *dstResource = vdp2.lnclBackBuffer.GetPointer();
         ID3D12Resource *uploadBufferPtr = vdp2.uploadBuffer.GetBufferResource().GetPointer();
-        UploadAllocation alloc{};
-
-        BufferTransitionBarrierSet barrier{features.enhancedBarriers};
-        barrier.Add(uploadBufferPtr, vdp2.uploadBuffer.GetSize(),                //
-                    D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                    D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        barrier.Emit(vdp2.cmdList);
-
         const size_t size = sizeof(vdp2.cpuLnclBack);
+
+        UploadAllocation alloc{};
         if (auto result = VDP2AllocateUploadBuffer(size, 4, alloc); !result) {
             return util::ErrorMessage{
                 fmt::format("Failed to allocate upload buffer for VDP2 LNCL/BACK screens: {}", result.Error().message)};
         }
         memcpy(alloc.data, &vdp2.cpuLnclBack, size);
 
-        ID3D12Resource *dstResource = vdp2.lnclBackBuffer.GetPointer();
-        vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
+        // Emit barrier transition
+        vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                             D3D12_BARRIER_ACCESS_COPY_DEST);
+        vdp2.barrierTracker.Flush(vdp2.cmdList);
 
-        barrier.Reverse().Emit(vdp2.cmdList);
+        vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
 
         return {};
     }
@@ -2902,27 +3321,23 @@ struct Direct3D12VDPRenderer::Impl {
     }
 
     util::VoidResult<> VDP2UploadRotationParameterBases() {
+        ID3D12Resource *dstResource = vdp2.rotParamBasesBuffer.GetPointer();
         ID3D12Resource *uploadBufferPtr = vdp2.uploadBuffer.GetBufferResource().GetPointer();
-        UploadAllocation alloc{};
-
-        BufferTransitionBarrierSet barrier{features.enhancedBarriers};
-        barrier.Add(uploadBufferPtr, vdp2.uploadBuffer.GetSize(),                //
-                    D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                    D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        barrier.Emit(vdp2.cmdList);
-
         const size_t size = sizeof(vdp2.cpuRotParamBases);
+
+        UploadAllocation alloc{};
         if (auto result = VDP2AllocateUploadBuffer(size, 4, alloc); !result) {
             return util::ErrorMessage{fmt::format(
                 "Failed to allocate upload buffer for VDP2 rotation parameter bases: {}", result.Error().message)};
         }
         memcpy(alloc.data, &vdp2.cpuRotParamBases, size);
 
-        ID3D12Resource *dstResource = vdp2.rotParamBasesBuffer.GetPointer();
-        vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
+        // Emit barrier transition
+        vdp2.barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_BARRIER_SYNC_COPY,
+                                             D3D12_BARRIER_ACCESS_COPY_DEST);
+        vdp2.barrierTracker.Flush(vdp2.cmdList);
 
-        barrier.Reverse().Emit(vdp2.cmdList);
+        vdp2.cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
 
         return {};
     }
@@ -2960,30 +3375,6 @@ struct Direct3D12VDPRenderer::Impl {
 
         auto &cmdList = vdp2.cmdList;
 
-        // Transition all rendering resources to compute shading usage
-        BufferTransitionBarrierSet barriers{features.enhancedBarriers};
-        barriers.Add(vdp2.vramBuffer.GetPointer(), kVDP2VRAMSize,                 //
-                     D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING, //
-                     D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_COMMON, //
-                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        barriers.Add(vdp2.cramColorBuffer.GetPointer(), kVDP2CRAMColorBufferSize, //
-                     D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING, //
-                     D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_COMMON, //
-                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        barriers.Add(vdp2.layerRenderParamsBuffer.GetPointer(), sizeof(vdp2.cpuLayerRenderParams), //
-                     D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING,                  //
-                     D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_COMMON,                  //
-                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        barriers.Add(vdp2.rotRegsBuffer.GetPointer(), sizeof(vdp2.cpuRotRegs),    //
-                     D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY, //
-                     D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST, //
-                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        barriers.Add(vdp2.rotParamBasesBuffer.GetPointer(), sizeof(vdp2.cpuRotParamBases), //
-                     D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_SYNC_COPY,          //
-                     D3D12_BARRIER_ACCESS_COMMON, D3D12_BARRIER_ACCESS_COPY_DEST,          //
-                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        barriers.Emit(cmdList);
-
         const bool deinterlace = enhancements.deinterlace && vdpState.regs2.TVMD.IsInterlaced();
         const uint32 yShift = deinterlace ? 1u : 0u;
 
@@ -2994,11 +3385,38 @@ struct Direct3D12VDPRenderer::Impl {
         const uint32 numLines = baseNumLines << yShift;
         vdp2.nextLayerRenderLine = y + 1;
 
+        // ---------------------------------------------------------------------
+
+        // Transition resources for rendering layers
+        vdp2.barrierTracker.TransitionBuffer(vdp2.layerRenderParamsBuffer.GetPointer(),
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                             D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        vdp2.barrierTracker.TransitionBuffer(vdp2.rotRegsBuffer.GetPointer(),
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                             D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        vdp2.barrierTracker.TransitionBuffer(vdp2.vramBuffer.GetPointer(),
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                             D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        vdp2.barrierTracker.TransitionBuffer(vdp2.cramColorBuffer.GetPointer(),
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                             D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+
         // Compute rotation parameters if any RBGs are enabled
         if (vdpState.regs2.bgEnabled[4] || vdpState.regs2.bgEnabled[5]) {
             vdp2.cpuCommonRenderParams.startY = startY;
 
             VDP2UploadRotationParameterBases();
+
+            vdp2.barrierTracker.TransitionBuffer(
+                vdp2.cramRotCoeffBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+            vdp2.barrierTracker.TransitionBuffer(
+                vdp2.rotParamBasesBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+            vdp2.barrierTracker.TransitionBuffer(
+                vdp2.rotParamStatesBuffer.GetPointer(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+            vdp2.barrierTracker.Flush(cmdList);
 
             const bool doubleResH = vdpState.regs2.TVMD.HRESOn & 0b010;
             const uint32 hresShift = doubleResH ? 1 : 0;
@@ -3008,16 +3426,51 @@ struct Direct3D12VDPRenderer::Impl {
             cmdList->SetComputeRoot32BitConstants(0, sizeof(vdp2.cpuCommonRenderParams) / sizeof(uint32),
                                                   &vdp2.cpuCommonRenderParams, 0);
             cmdList->SetComputeRootDescriptorTable(1, vdp2.calcRotParamsDescs.gpuHandle);
-            vdp2.cmdList->Dispatch(hres / 32, numLines, 1);
+            cmdList->Dispatch(hres / 32, numLines, 1);
         }
 
         vdp2.cpuCommonRenderParams.startY = startY << yShift;
 
-        // TODO: Draw sprite layer
-        // cmdList->Dispatch((HRes + 31) / 32, numLines, enhancements.transparentMeshes ? 2 : 1);
+        // ---------------------------------------------------------------------
 
-        // TODO: Draw color calculation window
-        // cmdList->Dispatch(HRes / 32, numLines, 1);
+        // Transition resources for drawing the sprite layer
+        vdp2.barrierTracker.TransitionTexture(vdp2.spriteAttrsTexture.GetPointer(),
+                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                                              D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                                              D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS);
+        vdp2.barrierTracker.Flush(cmdList);
+
+        // Draw sprite layer
+        cmdList->SetPipelineState(vdp2.drawSpritePSO.GetPointer());
+        cmdList->SetComputeRootSignature(vdp2.drawSpriteRootSig.GetPointer());
+        cmdList->SetComputeRoot32BitConstants(0, sizeof(vdp2.cpuCommonRenderParams) / sizeof(uint32),
+                                              &vdp2.cpuCommonRenderParams, 0);
+        cmdList->SetComputeRootDescriptorTable(1, vdp2.drawSpriteDescs.gpuHandle);
+        cmdList->Dispatch((HRes + 31) / 32, numLines, enhancements.transparentMeshes ? 2 : 1);
+
+        // ---------------------------------------------------------------------
+
+        // Transition resources for drawing background layers
+        if (vdpState.regs2.bgEnabled[4] || vdpState.regs2.bgEnabled[5]) {
+            vdp2.barrierTracker.TransitionBuffer(
+                vdp2.rotParamStatesBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        }
+        vdp2.barrierTracker.TransitionTexture(
+            vdp2.spriteAttrsTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
+        vdp2.barrierTracker.TransitionTexture(vdp2.layerOutTexture.GetPointer(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                              D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                                              D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS);
+        vdp2.barrierTracker.TransitionTexture(vdp2.rbgLineColorOutTexture.GetPointer(),
+                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                                              D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                                              D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS);
+        vdp2.barrierTracker.TransitionTexture(vdp2.colorCalcWindowTexture.GetPointer(),
+                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                                              D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                                              D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS);
+        vdp2.barrierTracker.Flush(cmdList);
 
         // Draw NBGs and RBGs
         cmdList->SetPipelineState(vdp2.drawBGsPSO.GetPointer());
@@ -3039,21 +3492,29 @@ struct Direct3D12VDPRenderer::Impl {
         vdp2.cpuCommonRenderParams.startY = vdp2.nextComposeLine;
         VDP2UploadLineColorBackScreens();
 
-        // Transition all compositing resources to compute shading usage
-        BufferTransitionBarrierSet barriers{features.enhancedBarriers};
-        barriers.Add(vdp2.composeParamsBuffer.GetPointer(), sizeof(vdp2.cpuComposeParams), //
-                     D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING,          //
-                     D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_COMMON,          //
-                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        barriers.Add(vdp2.lnclBackBuffer.GetPointer(), sizeof(vdp2.cpuLnclBack),  //
-                     D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COMPUTE_SHADING, //
-                     D3D12_BARRIER_ACCESS_COPY_DEST, D3D12_BARRIER_ACCESS_COMMON, //
-                     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        barriers.Emit(cmdList);
-
         // Determine how many lines to draw and update next scanline counter
         const uint32 numLines = y - vdp2.nextComposeLine + 1;
         vdp2.nextComposeLine = y + 1;
+
+        // ---------------------------------------------------------------------
+
+        // Transition resources for compositing layers
+        vdp2.barrierTracker.TransitionBuffer(vdp2.composeParamsBuffer.GetPointer(),
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                             D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        vdp2.barrierTracker.TransitionTexture(
+            vdp2.layerOutTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
+        vdp2.barrierTracker.TransitionTexture(
+            vdp2.rbgLineColorOutTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
+        vdp2.barrierTracker.TransitionTexture(
+            vdp2.colorCalcWindowTexture.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_COMMON);
+        vdp2.barrierTracker.TransitionBuffer(vdp2.lnclBackBuffer.GetPointer(),
+                                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                             D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        vdp2.barrierTracker.Flush(cmdList);
 
         // Compose final image
         cmdList->SetPipelineState(vdp2.composePSO.GetPointer());
@@ -3102,12 +3563,12 @@ struct Direct3D12VDPRenderer::Impl {
         cmdQueue->ExecuteCommandLists(1, cmdList.GetAddressOfBase());
 
         // Advance frame
-        VDP2FrameContext &currFrame = vdp2.frames.GetCurrentFrame();
+        FrameContext &currFrame = vdp2.frames.GetCurrentFrame();
         vdp2.uploadBuffer.EndFrame(vdp2.frames.currFenceValue + 1);
         vdp2.frames.MoveToNextFrame(fence, cmdQueue);
 
         // Setup command list
-        VDP2FrameContext &nextFrame = vdp2.frames.GetCurrentFrame();
+        FrameContext &nextFrame = vdp2.frames.GetCurrentFrame();
         ID3D12DescriptorHeap *heaps[] = {resourceHeap.GetPointer()};
         cmdList->Reset(nextFrame.cmdAlloc.GetPointer(), nullptr);
         cmdList->SetDescriptorHeaps(std::size(heaps), heaps);

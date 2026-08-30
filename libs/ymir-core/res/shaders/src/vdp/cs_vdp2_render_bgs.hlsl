@@ -11,15 +11,16 @@ cbuffer CommonRenderParamsBuffer : register(b0) {
     CommonRenderParams g_commonParams;
 }
 
-StructuredBuffer<LayerRenderParams> layerParams : register(t1);
+StructuredBuffer<LayerRenderParams> layerRenderParams : register(t1);
 StructuredBuffer<RotRegs> rotRegs : register(t2);
 ByteAddressBuffer vram : register(t3);
 Buffer<uint4> cramColor : register(t4);
 StructuredBuffer<RotParamState> rotParamStates : register(t5);
+Texture2DArray<uint> spriteAttrsIn : register(t6);
 
 RWTexture2DArray<uint4> layerOut : register(u0);
 RWTexture2DArray<uint4> rbgLineColorOut : register(u1);
-
+RWTexture2D<uint4> colorCalcWindowOut : register(u2);
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Parameters
@@ -35,7 +36,6 @@ static const uint displayResH = kResolutionsH[hreso & 3u]; // 3rd bit intentiona
 static const uint displayResV = exclusiveMonitor ? 480 : kResolutionsV[vreso];
 
 static const bool deinterlace = BitTest(g_commonParams.enhancements, 0);
-static const bool transparentMeshes = BitTest(g_commonParams.enhancements, 1);
 
 static const uint colorRAMMode = BitExtract(g_commonParams.displayParams, 6, 2);
 static const uint kCRAMAddressMask = colorRAMMode == 1 ? 0x7FF : 0x3FF;
@@ -110,7 +110,7 @@ bool InsideWindow(GlobalWindowParams window, bool invert, uint2 pos) {
 }
 
 bool InsideSpriteWindow(bool invert, uint2 pos) {
-    return BitTest(layerOut[uint3(pos, kLayerIndexSprite)].a, kPixelAttrBitSpriteShadowWindow) != invert;
+    return BitTest(spriteAttrsIn[uint3(pos, 0)], kSpriteAttrBitShadowWindow) != invert;
 }
 
 bool InsideWindows(LayerWindowParams layerWindows, uint2 pos) {
@@ -127,7 +127,7 @@ bool InsideWindows(LayerWindowParams layerWindows, uint2 pos) {
 
     bool inside = windowLogicAND;
     if (window0Enable) {
-        const bool insideW0 = InsideWindow(layerParams[0].windows[0], window0Invert, pos);
+        const bool insideW0 = InsideWindow(layerRenderParams[0].windows[0], window0Invert, pos);
         if (windowLogicAND) {
             inside = inside && insideW0;
         } else {
@@ -135,7 +135,7 @@ bool InsideWindows(LayerWindowParams layerWindows, uint2 pos) {
         }
     }
     if (window1Enable) {
-        const bool insideW1 = InsideWindow(layerParams[0].windows[1], window1Invert, pos);
+        const bool insideW1 = InsideWindow(layerRenderParams[0].windows[1], window1Invert, pos);
         if (windowLogicAND) {
             inside = inside && insideW1;
         } else {
@@ -162,7 +162,7 @@ bool InsideWindows(LayerWindowParamsS layerWindows, uint2 pos) {
 
     bool inside = windowLogicAND;
     if (window0Enable) {
-        const bool insideW0 = InsideWindow(layerParams[0].windows[0], window0Invert, pos);
+        const bool insideW0 = InsideWindow(layerRenderParams[0].windows[0], window0Invert, pos);
         if (windowLogicAND) {
             inside = inside && insideW0;
         } else {
@@ -170,7 +170,7 @@ bool InsideWindows(LayerWindowParamsS layerWindows, uint2 pos) {
         }
     }
     if (window1Enable) {
-        const bool insideW1 = InsideWindow(layerParams[0].windows[1], window1Invert, pos);
+        const bool insideW1 = InsideWindow(layerRenderParams[0].windows[1], window1Invert, pos);
         if (windowLogicAND) {
             inside = inside && insideW1;
         } else {
@@ -219,7 +219,7 @@ uint4 Color888(uint val32) {
 // Special color calculation bits
 
 bool IsSpecialColorCalcMatch(uint specFuncSelect, uint specColorCode) {
-    return BitTest(layerParams[0].specialFunctionCodes, specFuncSelect * 8 + specColorCode);
+    return BitTest(layerRenderParams[0].specialFunctionCodes, specFuncSelect * 8 + specColorCode);
 }
 
 bool GetSpecialColorCalcFlag(const BaseBGParams params, uint specColorCode, bool specColorCalc, bool colorMSB) {
@@ -395,6 +395,10 @@ uint4 FetchPixel(const BaseBGParams params, uint baseAddress, uint2 dotPos, uint
         outSpecColorCalc = false;
     }
 
+    if (outTransparent) {
+        return kTransparentPixel;
+    }
+
     uint outPriority = bgPriorityNum;
     if (bgPriorityMode == kPriorityModeCharacter) {
         outPriority &= ~1;
@@ -408,7 +412,6 @@ uint4 FetchPixel(const BaseBGParams params, uint baseAddress, uint2 dotPos, uint
 
     return uint4(
         outColor.rgb,
-        (outTransparent << kPixelAttrBitTransparent) |
         (outSpecColorCalc << kPixelAttrBitSpecColorCalc) |
         outPriority
     );
@@ -527,7 +530,7 @@ uint4 FetchScrollRBGPixel(const BaseBGParams params, uint2 scrollPos, uint2 page
 uint4 DrawNBG(uint2 pos, // pixel coordinates
               uint index // NBG index (0 to 3)
              ) {
-    const NBGParams params = layerParams[0].nbg[index];
+    const NBGParams params = layerRenderParams[0].nbg[index];
     if (!params.base.enabled) {
         return kTransparentPixel;
     }
@@ -678,7 +681,7 @@ uint SelectRotationParameter(const RBGParams params, uint2 pos) {
                 return transparent ? kRotParamB : kRotParamA;
             }
         case kRotParamModeWindow:
-            return InsideWindows(layerParams[0].rotWindows, pos) ? kRotParamB : kRotParamA;
+            return InsideWindows(layerRenderParams[0].rotWindows, pos) ? kRotParamB : kRotParamA;
     }
     return kRotParamA; // shouldn't happen
 }
@@ -714,8 +717,8 @@ void StoreRotationLineColorData(uint2 pos, uint2 rotPos, uint index, uint rotSel
             break;
     }
 
-    const bool lineColorPerLine = layerParams[0].lineScreenParams.perLine;
-    const uint lineColorBaseAddress = layerParams[0].lineScreenParams.baseAddress;
+    const bool lineColorPerLine = layerRenderParams[0].lineScreenParams.perLine;
+    const uint lineColorBaseAddress = layerRenderParams[0].lineScreenParams.baseAddress;
 
     const uint lineColorY = lineColorPerLine ? pos.y : 0;
     const uint lineColorAddress = lineColorBaseAddress + lineColorY * 2;
@@ -738,7 +741,7 @@ void StoreRotationLineColorData(uint2 pos, uint2 rotPos, uint index, uint rotSel
 }
 
 uint4 DrawScrollRBG(uint2 pos, uint index, uint rotSel, const RotParamState rotState) {
-    const RBGParams params = layerParams[0].rbg[index];
+    const RBGParams params = layerRenderParams[0].rbg[index];
 
     uint2 rotPos = pos;
     if (params.base.mosaicEnable) {
@@ -746,7 +749,7 @@ uint4 DrawScrollRBG(uint2 pos, uint index, uint rotSel, const RotParamState rotS
         rotPos.x -= rotPos.x % mosaicH;
     }
 
-    const RBGParams rotParams = layerParams[0].rbg[rotSel];
+    const RBGParams rotParams = layerRenderParams[0].rbg[rotSel];
     const uint2 pageShift = rotParams.base.pageShift;
 
     // Determine maximum coordinates and screen over process
@@ -778,7 +781,7 @@ uint4 DrawScrollRBG(uint2 pos, uint index, uint rotSel, const RotParamState rotS
 }
 
 uint4 DrawBitmapRBG(uint2 pos, uint index, uint rotSel, const RotParamState rotState) {
-    const RBGParams params = layerParams[0].rbg[index];
+    const RBGParams params = layerRenderParams[0].rbg[index];
     const uint screenOverProcess = params.screenOverProcess;
 
     uint2 rotPos = pos;
@@ -787,7 +790,7 @@ uint4 DrawBitmapRBG(uint2 pos, uint index, uint rotSel, const RotParamState rotS
         rotPos.x -= rotPos.x % mosaicH;
     }
 
-    const uint2 pageShift = layerParams[0].rbg[rotSel].base.pageShift;
+    const uint2 pageShift = layerRenderParams[0].rbg[rotSel].base.pageShift;
 
     // Determine maximum coordinates and screen over process
     const bool usingFixed512 = screenOverProcess == kScreenOverProcessFixed512;
@@ -809,7 +812,7 @@ uint4 DrawBitmapRBG(uint2 pos, uint index, uint rotSel, const RotParamState rotS
 uint4 DrawRBG(uint2 pos, // pixel coordinates
               uint index // RBG index (0 to 1)
              ) {
-    const RBGParams params = layerParams[0].rbg[index];
+    const RBGParams params = layerRenderParams[0].rbg[index];
     if (!params.base.enabled) {
         return kTransparentPixel;
     }
@@ -841,9 +844,24 @@ uint4 DrawRBG(uint2 pos, // pixel coordinates
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Color calculation window
+
+bool InsideColorCalcWindow(uint2 pos) {
+    LayerWindowParamsS ccWindows;
+    ccWindows.base.windowLogicAnd = BitTest(g_commonParams.windows, 5);
+    ccWindows.base.window0Enable = BitTest(g_commonParams.windows, 6);
+    ccWindows.base.window0Invert = BitTest(g_commonParams.windows, 7);
+    ccWindows.base.window1Enable = BitTest(g_commonParams.windows, 8);
+    ccWindows.base.window1Invert = BitTest(g_commonParams.windows, 9);
+    ccWindows.spriteWindowEnable = BitTest(g_commonParams.windows, 10);
+    ccWindows.spriteWindowInvert = BitTest(g_commonParams.windows, 11);
+    return InsideWindows(ccWindows, pos);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Entrypoint
 
-[numthreads(32, 1, 6)]
+[numthreads(32, 1, 7)]
 void CSMain(uint3 id : SV_DispatchThreadID) {
     const uint2 drawCoord = uint2(id.x, id.y + g_commonParams.startY);
     const uint3 outCoord = uint3(drawCoord.x, GetY(drawCoord.y, false), id.z);
@@ -851,5 +869,7 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
         layerOut[outCoord] = DrawNBG(drawCoord, id.z);
     } else if (id.z <= 5) {
         layerOut[outCoord] = DrawRBG(drawCoord, id.z - 4);
+    } else if (id.z == 6) {
+        colorCalcWindowOut[outCoord.xy] = InsideColorCalcWindow(drawCoord);
     }
 }
