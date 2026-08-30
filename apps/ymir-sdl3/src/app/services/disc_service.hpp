@@ -53,8 +53,10 @@ public:
     /// @param[in] showErrorModal Whether to show an error dialog if loading fails.
     /// @return True if successful.
     bool LoadDiscImage(std::filesystem::path path, bool showErrorModal);
-    
-    // TODO: add some documenation here
+
+    /// @brief Asynchronously calls AsyncDiscLoad
+    /// @param[in] path A reference to the path of to the disc image.
+    /// @param[in] showErrorModal Whether to show an error dialog if loading fails.
     void LoadDiscImageAsync(std::filesystem::path& path, bool showErrorModal);
 
     /// @brief Loads the list of recent discs from disk.
@@ -69,6 +71,9 @@ private:
     Settings &m_settings;
     ShowModalCallback m_showModal;
     
+    /// @brief Preprocesses disc image file and enqueues an ApplyDisc event to load the disc after it has been preprocessed
+    /// @param[in] path Path to the disc image.
+    /// @param[in] showErrorModal Whether to show an error dialog if loading fails.
     void AsyncDiscLoad(std::filesystem::path path, bool showErrorModal);
 };
 
