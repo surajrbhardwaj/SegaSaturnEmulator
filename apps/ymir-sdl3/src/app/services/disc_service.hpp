@@ -24,7 +24,7 @@ public:
         std::filesystem::path path;
         std::optional<ymir::media::Disc> disc;
     };
-    
+
     std::mutex threadMutex;
     std::thread asyncDiscLoadThread;
 

@@ -61,45 +61,45 @@ constexpr std::string_view EmuEventToString(EmuEvent::Type type) {
     switch (type) {
         case EmuEvent::Type::FactoryReset:
             return "FactoryReset";
-        case EmuEvent::Type::HardReset:                    
+        case EmuEvent::Type::HardReset:
             return "HardReset";
-        case EmuEvent::Type::SoftReset:                    
+        case EmuEvent::Type::SoftReset:
             return "SoftReset";
-        case EmuEvent::Type::SetResetButton:               
+        case EmuEvent::Type::SetResetButton:
             return "SetResetButton";
-        case EmuEvent::Type::SetPaused:                    
+        case EmuEvent::Type::SetPaused:
             return "SetPaused";
-        case EmuEvent::Type::ForwardFrameStep:             
+        case EmuEvent::Type::ForwardFrameStep:
             return "ForwardFrameStep";
-        case EmuEvent::Type::ReverseFrameStep:             
+        case EmuEvent::Type::ReverseFrameStep:
             return "ReverseFrameStep";
-        case EmuEvent::Type::StepMSH2:                     
+        case EmuEvent::Type::StepMSH2:
             return "StepMSH2";
-        case EmuEvent::Type::StepSSH2:                     
+        case EmuEvent::Type::StepSSH2:
             return "StepSSH2";
-        case EmuEvent::Type::OpenCloseTray:                
+        case EmuEvent::Type::OpenCloseTray:
             return "OpenCloseTray";
-        case EmuEvent::Type::LoadDisc:                     
+        case EmuEvent::Type::LoadDisc:
             return "LoadDisc";
-        case EmuEvent::Type::ApplyDisc:                     
+        case EmuEvent::Type::ApplyDisc:
             return "ApplyDisc";
-        case EmuEvent::Type::OpenHostDevice:               
+        case EmuEvent::Type::OpenHostDevice:
             return "OpenHostDevice";
-        case EmuEvent::Type::EjectDisc:                    
+        case EmuEvent::Type::EjectDisc:
             return "EjectDisc";
-        case EmuEvent::Type::RemoveCartridge:              
+        case EmuEvent::Type::RemoveCartridge:
             return "RemoveCartridge";
-        case EmuEvent::Type::ReplaceInternalBackupMemory:  
+        case EmuEvent::Type::ReplaceInternalBackupMemory:
             return "ReplaceInternalBackupMemory";
-        case EmuEvent::Type::ReplaceExternalBackupMemory:  
+        case EmuEvent::Type::ReplaceExternalBackupMemory:
             return "ReplaceExternalBackupMemory";
-        case EmuEvent::Type::RunFunction:                  
+        case EmuEvent::Type::RunFunction:
             return "RunFunction";
-        case EmuEvent::Type::ReceiveMidiInput:             
+        case EmuEvent::Type::ReceiveMidiInput:
             return "ReceiveMidiInput";
-        case EmuEvent::Type::SetThreadPriority:            
+        case EmuEvent::Type::SetThreadPriority:
             return "SetThreadPriority";
-        case EmuEvent::Type::Shutdown:                     
+        case EmuEvent::Type::Shutdown:
             return "Shutdown";
         default:
             return "Unknown";

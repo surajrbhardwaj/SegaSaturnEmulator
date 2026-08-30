@@ -1729,7 +1729,6 @@ void App::RunEmulator() {
         for (size_t i = 0; i < evtCount; i++) {
             const GUIEvent &evt = evts[i];
             using EvtType = GUIEvent::Type;
-            const auto start = std::chrono::steady_clock::now();
             switch (evt.type) {
             case EvtType::LoadDisc: m_discService.OpenLoadDiscDialog(); break;
             case EvtType::LoadRecommendedGameCartridge: m_romService.LoadRecommendedCartridge(); break;
@@ -1947,7 +1946,6 @@ void App::RunEmulator() {
                 break;
             case EvtType::StateSaved: m_saveStateService.PersistSaveState(std::get<uint32>(evt.value)); break;
             }
-            std::cout << "gui event " << evt << " took " << std::chrono::steady_clock::now()-start << " to run" << std::endl;
         }
 
         // Update display
@@ -3383,7 +3381,6 @@ void App::EmulatorThread() {
 
     std::array<EmuEvent, 64> evts{};
 
-    std::filesystem::path p;
     while (true) {
         const bool paused = m_context.paused;
         StepAction stepAction = paused ? StepAction::Noop : StepAction::RunFrame;
@@ -3395,8 +3392,6 @@ void App::EmulatorThread() {
             EmuEvent &evt = evts[i];
             using enum EmuEvent::Type;
             
-            auto start = std::chrono::steady_clock::now();
-
             switch (evt.type) {
             case FactoryReset:
                 m_context.saturn.instance->FactoryReset();
@@ -3552,7 +3547,6 @@ void App::EmulatorThread() {
 
             case Shutdown: m_context.saturn.instance->VDP.UseNullRenderer(); return;
             }
-            std::cout << "emu event " << evt << " took " << std::chrono::steady_clock::now()-start << " to run" << std::endl;
         }
 
         // Emulate one frame
