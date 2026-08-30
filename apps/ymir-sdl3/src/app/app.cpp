@@ -3391,7 +3391,7 @@ void App::EmulatorThread() {
         for (size_t i = 0; i < evtCount; i++) {
             EmuEvent &evt = evts[i];
             using enum EmuEvent::Type;
-            
+
             switch (evt.type) {
             case FactoryReset:
                 m_context.saturn.instance->FactoryReset();

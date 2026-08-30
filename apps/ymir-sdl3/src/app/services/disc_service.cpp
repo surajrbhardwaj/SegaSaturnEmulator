@@ -159,8 +159,8 @@ void DiscService::LoadDiscImageAsync(std::filesystem::path& path, bool showError
         }
         else {itr++;}
     }
-    auto temp = std::make_shared<std::atomic<bool>>(false);
-    asyncDiscLoadThreads.emplace_back(std::thread(&DiscService::AsyncDiscLoad, this, path, showErrorModal, temp), temp);
+    auto flag = std::make_shared<std::atomic<bool>>(false);
+    asyncDiscLoadThreads.emplace_back(std::thread(&DiscService::AsyncDiscLoad, this, path, showErrorModal, flag), flag);
 }
 
 void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal, std::shared_ptr<std::atomic<bool>> finishedFlag) {

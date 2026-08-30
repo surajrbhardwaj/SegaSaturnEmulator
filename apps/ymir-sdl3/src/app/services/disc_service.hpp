@@ -66,7 +66,7 @@ private:
     ShowModalCallback m_showModal;
     std::mutex threadListMutex;
     std::list<std::pair<std::thread, std::shared_ptr<std::atomic<bool>>>> asyncDiscLoadThreads;
-    
+
     /// @brief Preprocesses disc image file and enqueues an ApplyDisc event to load the disc after it has been preprocessed
     /// @param[in] path Path to the disc image.
     /// @param[in] showErrorModal Whether to show an error dialog if loading fails.
