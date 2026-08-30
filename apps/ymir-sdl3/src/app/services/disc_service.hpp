@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <optional>
+#include <list>
 
 // Forward declaration to break the circular depencencies
 namespace app {
@@ -25,17 +26,10 @@ public:
         std::optional<ymir::media::Disc> disc;
     };
 
-    std::mutex threadMutex;
-    std::thread asyncDiscLoadThread;
-
     using ShowModalCallback = std::function<void(std::string title, std::function<void()> contents)>;
 
     DiscService(SharedContext &context, Settings &settings, ShowModalCallback showModal);
-    ~DiscService() {
-        if(asyncDiscLoadThread.joinable()) {
-            asyncDiscLoadThread.join();
-        }
-    }
+    ~DiscService();
 
     DiscService(const DiscService &) = delete;
     DiscService &operator=(const DiscService &) = delete;
@@ -70,11 +64,14 @@ private:
     SharedContext &m_context;
     Settings &m_settings;
     ShowModalCallback m_showModal;
+    std::mutex threadListMutex;
+    std::list<std::pair<std::thread, std::shared_ptr<std::atomic<bool>>>> asyncDiscLoadThreads;
     
     /// @brief Preprocesses disc image file and enqueues an ApplyDisc event to load the disc after it has been preprocessed
     /// @param[in] path Path to the disc image.
     /// @param[in] showErrorModal Whether to show an error dialog if loading fails.
-    void AsyncDiscLoad(std::filesystem::path path, bool showErrorModal);
+    /// @param[in] finishedFlag A smart pointer to a bool serving as a flag to indicate whether the disc has finished loading
+    void AsyncDiscLoad(std::filesystem::path path, bool showErrorModal, std::shared_ptr<std::atomic<bool>> finishedFlag);
 };
 
 } // namespace app::services

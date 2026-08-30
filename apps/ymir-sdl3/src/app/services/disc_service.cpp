@@ -28,6 +28,13 @@ DiscService::DiscService(SharedContext &context, Settings &settings, ShowModalCa
     , m_settings(settings)
     , m_showModal(std::move(showModal)) {}
 
+DiscService::~DiscService() {
+    std::lock_guard<std::mutex> lock(threadListMutex);
+    for(auto itr=asyncDiscLoadThreads.begin(); itr!=asyncDiscLoadThreads.end(); ) {
+        if(itr->first.joinable()) {itr->first.join();}
+        itr = asyncDiscLoadThreads.erase(itr);
+    }
+}
 void DiscService::OpenLoadDiscDialog() {
     FileDialogParams params{};
     params.dialogTitle = "Load Sega Saturn disc image";
@@ -58,9 +65,13 @@ void DiscService::ProcessOpenDiscImageFileDialogSelection(const char *const *fil
 }
 
 bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal) {
-    // If a disc is being loaded asyncronously, wait until it is done
-    if(asyncDiscLoadThread.joinable()) {
-        asyncDiscLoadThread.join();
+    // If any discs are being loaded asyncronously, wait until they are done
+    {
+        std::lock_guard<std::mutex> lock(threadListMutex);
+        for(auto itr=asyncDiscLoadThreads.begin(); itr!=asyncDiscLoadThreads.end(); ) {
+            if(itr->first.joinable()) {itr->first.join();}
+            itr = asyncDiscLoadThreads.erase(itr);
+        }
     }
 
     // Try to load disc image from specified path
@@ -140,14 +151,19 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
 
 void DiscService::LoadDiscImageAsync(std::filesystem::path& path, bool showErrorModal) {
     // If a disc is being loaded asyncronously, wait until it is done
-    std::lock_guard<std::mutex> lock(threadMutex);
-    if(asyncDiscLoadThread.joinable()) {
-        asyncDiscLoadThread.join();
+    std::lock_guard<std::mutex> lock(threadListMutex);
+    for(auto itr=asyncDiscLoadThreads.begin(); itr!=asyncDiscLoadThreads.end(); ) {
+        if(itr->second->load()) {
+            if(itr->first.joinable()) {itr->first.join();}
+            itr = asyncDiscLoadThreads.erase(itr);
+        }
+        else {itr++;}
     }
-    asyncDiscLoadThread = std::thread(&DiscService::AsyncDiscLoad, this, path, showErrorModal);
+    auto temp = std::make_shared<std::atomic<bool>>(false);
+    asyncDiscLoadThreads.emplace_back(std::thread(&DiscService::AsyncDiscLoad, this, path, showErrorModal, temp), temp);
 }
 
-void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal) {
+void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal, std::shared_ptr<std::atomic<bool>> finishedFlag) {
     // Try to load disc image from specified path
     devlog::info<grp::base>("Loading disc image from {}", path);
     app::services::DiscService::AsyncLoadState loadState;
@@ -221,6 +237,7 @@ void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal)
     }
     else {devlog::info<grp::base>("Disc image loaded succesfully");}
     m_context.EnqueueEvent(app::EmuEvent{app::EmuEvent::Type::ApplyDisc, std::move(loadState)});
+    *finishedFlag = true;
 }
 
 void DiscService::LoadRecentDiscs() {
