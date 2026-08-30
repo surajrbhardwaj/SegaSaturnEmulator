@@ -26,9 +26,7 @@ namespace app::services {
 DiscService::DiscService(SharedContext &context, Settings &settings, ShowModalCallback showModal)
     : m_context(context)
     , m_settings(settings)
-    , m_showModal(std::move(showModal))
-    , m_asyncLoadStatus(DiscService::DiscLoadStatus::DEFAULT)
-    , asyncDisc(std::nullopt) {}
+    , m_showModal(std::move(showModal)) {}
 
 void DiscService::OpenLoadDiscDialog() {
     FileDialogParams params{};
@@ -63,7 +61,6 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     // If a disc is being loaded asyncronously, wait until it is done
     if(asyncDiscLoadThread.joinable()) {
         asyncDiscLoadThread.join();
-        m_asyncLoadStatus = DiscService::DiscLoadStatus::DEFAULT;
     }
 
     // Try to load disc image from specified path
@@ -136,26 +133,27 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     }
     devlog::info<grp::base>("Disc image loaded succesfully");
 
-    UpdateSettingsAndContext(std::move(disc), std::move(path));
+    UpdateSettingsAndContext(disc, path);
 
     return true;
 }
 
-void DiscService::LoadDiscImageAsync(std::filesystem::path path, bool showErrorModal) {
+void DiscService::LoadDiscImageAsync(std::filesystem::path& path, bool showErrorModal) {
     // If a disc is being loaded asyncronously, wait until it is done
     std::lock_guard<std::mutex> lock(threadMutex);
     if(asyncDiscLoadThread.joinable()) {
         asyncDiscLoadThread.join();
-        m_asyncLoadStatus = DiscService::DiscLoadStatus::DEFAULT;
     }
-    asyncDiscLoadThread = std::thread(&DiscService::AsyncLoad, this, path, showErrorModal);
+    asyncDiscLoadThread = std::thread(&DiscService::AsyncDiscLoad, this, path, showErrorModal);
 }
 
-void DiscService::AsyncLoad(std::filesystem::path path, bool showErrorModal) {
-
+void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal) {
     // Try to load disc image from specified path
     devlog::info<grp::base>("Loading disc image from {}", path);
-    ymir::media::Disc disc{};
+    app::services::DiscService::AsyncLoadState loadState;
+    loadState.disc = ymir::media::Disc{};
+    ymir::media::Disc& disc = loadState.disc.value();
+    loadState.path = path;
 
     auto showError = [this, path](std::string message) {
         m_showModal("Error", [this, path, message] {
@@ -219,12 +217,10 @@ void DiscService::AsyncLoad(std::filesystem::path path, bool showErrorModal) {
                                    }
                                })) {
         devlog::error<grp::base>("Failed to load disc image");
-        m_asyncLoadStatus = DiscLoadStatus::FAIL;
+        loadState.disc = std::nullopt;
     }
-    devlog::info<grp::base>("Disc image loaded succesfully");
-    this->asyncDisc = std::move(disc);
-    this->asyncPath = std::move(path);
-    m_asyncLoadStatus = DiscLoadStatus::SUCCESS;
+    else {devlog::info<grp::base>("Disc image loaded succesfully");}
+    m_context.EnqueueEvent(app::EmuEvent{app::EmuEvent::Type::ApplyDisc, std::move(loadState)});
 }
 
 void DiscService::LoadRecentDiscs() {
@@ -257,7 +253,7 @@ void DiscService::SaveRecentDiscs() {
     }
 }
 
-void DiscService::UpdateSettingsAndContext(ymir::media::Disc disc, std::filesystem::path path) {
+void DiscService::UpdateSettingsAndContext(ymir::media::Disc& disc, std::filesystem::path& path) {
     // Insert disc into the Saturn drive
     {
         std::unique_lock lock{m_context.locks.disc};

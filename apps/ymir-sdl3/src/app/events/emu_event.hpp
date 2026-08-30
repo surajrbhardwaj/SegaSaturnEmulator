@@ -1,5 +1,7 @@
 #pragma once
 
+#include <app/services/disc_service.hpp>
+
 #include <ymir/hw/scsp/scsp_midi_defs.hpp>
 #include <ymir/sys/backup_ram.hpp>
 
@@ -9,6 +11,7 @@
 #include <string_view>
 #include <string>
 #include <variant>
+#include <optional>
 
 namespace app {
 
@@ -29,6 +32,7 @@ struct EmuEvent {
 
         OpenCloseTray,
         LoadDisc,
+        ApplyDisc,
         OpenHostDevice,
         EjectDisc,
 
@@ -49,7 +53,7 @@ struct EmuEvent {
     Type type;
 
     std::variant<std::monostate, ymir::scsp::MidiMessage, bool, std::string, std::filesystem::path,
-                 ymir::bup::BackupMemory, std::function<void(SharedContext &)>>
+                 ymir::bup::BackupMemory, std::function<void(SharedContext &)>, services::DiscService::AsyncLoadState>
         value;
 };
 
@@ -77,6 +81,8 @@ constexpr std::string_view EmuEventToString(EmuEvent::Type type) {
             return "OpenCloseTray";
         case EmuEvent::Type::LoadDisc:                     
             return "LoadDisc";
+        case EmuEvent::Type::ApplyDisc:                     
+            return "ApplyDisc";
         case EmuEvent::Type::OpenHostDevice:               
             return "OpenHostDevice";
         case EmuEvent::Type::EjectDisc:                    

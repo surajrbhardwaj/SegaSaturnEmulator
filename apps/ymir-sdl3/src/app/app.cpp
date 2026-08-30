@@ -3397,16 +3397,6 @@ void App::EmulatorThread() {
             
             auto start = std::chrono::steady_clock::now();
 
-            switch(m_discService.m_asyncLoadStatus.load()) {
-                case app::services::DiscService::DiscLoadStatus::SUCCESS:
-                    m_discService.UpdateSettingsAndContext(std::move(m_discService.asyncDisc.value()), p);
-                case app::services::DiscService::DiscLoadStatus::FAIL:
-                    m_discService.m_asyncLoadStatus = app::services::DiscService::DiscLoadStatus::DEFAULT;
-                    std::cout << "UpdateSettingsAndContext took " << std::chrono::steady_clock::now()-start << " to run" << std::endl;
-                    break;
-            }
-
-            start = std::chrono::steady_clock::now();
             switch (evt.type) {
             case FactoryReset:
                 m_context.saturn.instance->FactoryReset();
@@ -3480,11 +3470,17 @@ void App::EmulatorThread() {
             case LoadDisc: //
             {
                 auto &path = std::get<std::filesystem::path>(evt.value);
-                // LoadDiscImage locks the disc mutex
                 m_discService.LoadDiscImageAsync(path, true);
-                p = path;
-                /*
-                if (m_discService.LoadDiscImage(path, true)) {
+                break;
+            }
+            case ApplyDisc:
+            {
+                app::services::DiscService::AsyncLoadState& loadState = std::get<app::services::DiscService::AsyncLoadState>(evt.value);
+                if(loadState.disc) {
+                    // UpdateSettingsAndContext locks the disc mutex
+                    m_discService.UpdateSettingsAndContext(loadState.disc.value(), loadState.path);
+                }
+                else {
                     m_saveStateService.LoadSaveStates();
                     m_saveStateService.LoadDebuggerState();
                     auto iplLoadResult = m_romService.LoadIPLROM();
@@ -3493,7 +3489,6 @@ void App::EmulatorThread() {
                             fmt::format("Could not load IPL ROM: {}", iplLoadResult.errorMessage));
                     }
                 }
-                */
                 break;
             }
             case OpenHostDevice: //

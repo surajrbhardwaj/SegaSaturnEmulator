@@ -1,7 +1,6 @@
 #pragma once
 
 #include <app/settings.hpp>
-#include <app/shared_context.hpp>
 
 #include <ymir/media/disc.hpp>
 
@@ -11,22 +10,23 @@
 #include <thread>
 #include <optional>
 
+// Forward declaration to break the circular depencencies
+namespace app {
+    struct SharedContext;
+}
+
 namespace app::services {
 
 /// @brief Handles loading disc images and the recent games list.
 class DiscService {
 public:
-    enum class DiscLoadStatus : uint8 {
-        DEFAULT = 0,
-        SUCCESS = 1,
-        FAIL = 2
+    struct AsyncLoadState {
+        std::filesystem::path path;
+        std::optional<ymir::media::Disc> disc;
     };
     
-    std::atomic<DiscLoadStatus> m_asyncLoadStatus;
     std::mutex threadMutex;
     std::thread asyncDiscLoadThread;
-    std::optional<ymir::media::Disc> asyncDisc;
-    std::filesystem::path asyncPath;
 
     using ShowModalCallback = std::function<void(std::string title, std::function<void()> contents)>;
 
@@ -55,7 +55,7 @@ public:
     bool LoadDiscImage(std::filesystem::path path, bool showErrorModal);
     
     // TODO: add some documenation here
-    void LoadDiscImageAsync(std::filesystem::path path, bool showErrorModal);
+    void LoadDiscImageAsync(std::filesystem::path& path, bool showErrorModal);
 
     /// @brief Loads the list of recent discs from disk.
     void LoadRecentDiscs();
@@ -63,13 +63,13 @@ public:
     /// @brief Saves the list of recent discs to disk.
     void SaveRecentDiscs();
 
-    void UpdateSettingsAndContext(ymir::media::Disc disc, std::filesystem::path path);
+    void UpdateSettingsAndContext(ymir::media::Disc& disc, std::filesystem::path& path);
 private:
     SharedContext &m_context;
     Settings &m_settings;
     ShowModalCallback m_showModal;
     
-    void AsyncLoad(std::filesystem::path path, bool showErrorModal);
+    void AsyncDiscLoad(std::filesystem::path path, bool showErrorModal);
 };
 
 } // namespace app::services
