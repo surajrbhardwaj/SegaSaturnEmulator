@@ -29,10 +29,12 @@ DiscService::DiscService(SharedContext &context, Settings &settings, ShowModalCa
     , m_showModal(std::move(showModal)) {}
 
 DiscService::~DiscService() {
-    std::lock_guard<std::mutex> lock(threadListMutex);
-    for(auto itr=asyncDiscLoadThreads.begin(); itr!=asyncDiscLoadThreads.end(); ) {
-        if(itr->first.joinable()) {itr->first.join();}
-        itr = asyncDiscLoadThreads.erase(itr);
+    std::lock_guard<std::mutex> lock(m_threadListMutex);
+    for (auto itr = m_asyncDiscLoadThreads.begin(); itr != m_asyncDiscLoadThreads.end();) {
+        if (itr->first.joinable()) {
+            itr->first.join();
+        }
+        itr = m_asyncDiscLoadThreads.erase(itr);
     }
 }
 void DiscService::OpenLoadDiscDialog() {
@@ -67,10 +69,12 @@ void DiscService::ProcessOpenDiscImageFileDialogSelection(const char *const *fil
 bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal) {
     // If any discs are being loaded asyncronously, wait until they are done
     {
-        std::lock_guard<std::mutex> lock(threadListMutex);
-        for(auto itr=asyncDiscLoadThreads.begin(); itr!=asyncDiscLoadThreads.end(); ) {
-            if(itr->first.joinable()) {itr->first.join();}
-            itr = asyncDiscLoadThreads.erase(itr);
+        std::lock_guard<std::mutex> lock(m_threadListMutex);
+        for (auto itr = m_asyncDiscLoadThreads.begin(); itr != m_asyncDiscLoadThreads.end();) {
+            if (itr->first.joinable()) {
+                itr->first.join();
+            }
+            itr = m_asyncDiscLoadThreads.erase(itr);
         }
     }
 
@@ -149,26 +153,30 @@ bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal)
     return true;
 }
 
-void DiscService::LoadDiscImageAsync(std::filesystem::path& path, bool showErrorModal) {
+void DiscService::LoadDiscImageAsync(std::filesystem::path &path, bool showErrorModal) {
     // If a disc is being loaded asyncronously, wait until it is done
-    std::lock_guard<std::mutex> lock(threadListMutex);
-    for(auto itr=asyncDiscLoadThreads.begin(); itr!=asyncDiscLoadThreads.end(); ) {
-        if(itr->second->load()) {
-            if(itr->first.joinable()) {itr->first.join();}
-            itr = asyncDiscLoadThreads.erase(itr);
+    std::lock_guard<std::mutex> lock(m_threadListMutex);
+    for (auto itr = m_asyncDiscLoadThreads.begin(); itr != m_asyncDiscLoadThreads.end();) {
+        if (itr->second->load()) {
+            if (itr->first.joinable()) {
+                itr->first.join();
+            }
+            itr = m_asyncDiscLoadThreads.erase(itr);
+        } else {
+            itr++;
         }
-        else {itr++;}
     }
     auto flag = std::make_shared<std::atomic<bool>>(false);
-    asyncDiscLoadThreads.emplace_back(std::thread(&DiscService::AsyncDiscLoad, this, path, showErrorModal, flag), flag);
+    m_asyncDiscLoadThreads.emplace_back(std::thread(&DiscService::AsyncDiscLoad, this, path, showErrorModal, flag), flag);
 }
 
-void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal, std::shared_ptr<std::atomic<bool>> finishedFlag) {
+void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal,
+                                std::shared_ptr<std::atomic<bool>> finishedFlag) {
     // Try to load disc image from specified path
     devlog::info<grp::base>("Loading disc image from {}", path);
     app::services::DiscService::AsyncLoadState loadState;
     loadState.disc = ymir::media::Disc{};
-    ymir::media::Disc& disc = loadState.disc.value();
+    ymir::media::Disc &disc = loadState.disc.value();
     loadState.path = path;
 
     auto showError = [this, path](std::string message) {
@@ -234,8 +242,9 @@ void DiscService::AsyncDiscLoad(std::filesystem::path path, bool showErrorModal,
                                })) {
         devlog::error<grp::base>("Failed to load disc image");
         loadState.disc = std::nullopt;
+    } else {
+        devlog::info<grp::base>("Disc image loaded succesfully");
     }
-    else {devlog::info<grp::base>("Disc image loaded succesfully");}
     m_context.EnqueueEvent(app::EmuEvent{app::EmuEvent::Type::ApplyDisc, std::move(loadState)});
     *finishedFlag = true;
 }
@@ -270,7 +279,7 @@ void DiscService::SaveRecentDiscs() {
     }
 }
 
-void DiscService::UpdateSettingsAndContext(ymir::media::Disc& disc, std::filesystem::path& path) {
+void DiscService::UpdateSettingsAndContext(ymir::media::Disc &disc, std::filesystem::path &path) {
     // Insert disc into the Saturn drive
     {
         std::unique_lock lock{m_context.locks.disc};

@@ -97,8 +97,8 @@
 #ifdef _WIN32
     #include <app/services/gfx/gfx_d3d_utils.hpp>
 #endif
-#include <app/services/gfx/gfx_adapters.hpp>
 #include <app/services/disc_service.hpp>
+#include <app/services/gfx/gfx_adapters.hpp>
 
 #include <app/input/input_backend_sdl3.hpp>
 #include <app/input/input_utils.hpp>
@@ -3468,14 +3468,13 @@ void App::EmulatorThread() {
                 m_discService.LoadDiscImageAsync(path, true);
                 break;
             }
-            case ApplyDisc:
-            {
-                app::services::DiscService::AsyncLoadState& loadState = std::get<app::services::DiscService::AsyncLoadState>(evt.value);
-                if(loadState.disc) {
+            case ApplyDisc: {
+                app::services::DiscService::AsyncLoadState &loadState =
+                    std::get<app::services::DiscService::AsyncLoadState>(evt.value);
+                if (loadState.disc) {
                     // UpdateSettingsAndContext locks the disc mutex
                     m_discService.UpdateSettingsAndContext(loadState.disc.value(), loadState.path);
-                }
-                else {
+                } else {
                     m_saveStateService.LoadSaveStates();
                     m_saveStateService.LoadDebuggerState();
                     auto iplLoadResult = m_romService.LoadIPLROM();
